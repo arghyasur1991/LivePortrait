@@ -13,6 +13,7 @@ pretrained_weights/*.md
 pretrained_weights/docs
 pretrained_weights/liveportrait
 pretrained_weights/liveportrait_animals
+pretrained_weights/insightface/
 
 # Ipython notebook
 *.ipynb
