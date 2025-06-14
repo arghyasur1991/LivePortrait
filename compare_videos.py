@@ -8,12 +8,12 @@ def compare_videos():
 
     # Load videos
     pytorch_video = "animations_pytorch/s6--d0.mp4"
-    onnx_video = "animations_onnx_opset20_final/s6_onnx_d0.mp4"  # Latest opset 20 version
+    onnx_video = "animations_onnx_corrected_keypoints/s6_onnx_d0.mp4"  # Corrected keypoint handling
 
     cap_pytorch = cv2.VideoCapture(pytorch_video)
     cap_onnx = cv2.VideoCapture(onnx_video)
 
-    print("=== Video Comparison: PyTorch vs ONNX (Opset 20 + Original Grid Sample) ===")
+    print("=== Video Comparison: PyTorch vs ONNX (CORRECTED KEYPOINT HANDLING) ===")
 
     # Get video properties
     pytorch_frames = int(cap_pytorch.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -68,7 +68,7 @@ def compare_videos():
     print("\n=== Summary ===")
     print("✅ If frame change values are > 0, animation is working")
     print("✅ If PyTorch vs ONNX difference is reasonable (~5-20), they're producing similar results")
-    print("🎯 FINAL TEST: Opset 20 + Original Grid Sample + Updated Runtime")
+    print("🔧 DOUBLE FIX: Corrected argument order + proper keypoint format handling")
 
 if __name__ == "__main__":
     compare_videos()

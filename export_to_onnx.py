@@ -142,8 +142,8 @@ def export_warping_network_to_onnx(model, output_path: str, device='cpu', opset_
             kp_driving: (B, num_kp, 3)
             kp_source: (B, num_kp, 3)
             """
-            # Call the original warping network
-            result = self.warping_network(feature_3d, kp_source, kp_driving)
+            # Call the original warping network with CORRECT argument order
+            result = self.warping_network(feature_3d, kp_driving, kp_source)
 
             # Handle different return formats
             if isinstance(result, dict):

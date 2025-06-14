@@ -1,646 +1,488 @@
-#!/usr/bin/env python3
-"""
-ONNX Inference Script for LivePortrait
-This script performs inference using only ONNX models, no PyTorch models.
-
-Usage:
-    conda activate LivePortrait
-    python onnx_inference.py --source assets/examples/source/s6.jpg --driving assets/examples/driving/d0.mp4
-"""
-
-import os
-import os.path as osp
-import sys
 import cv2
 import numpy as np
-import onnxruntime as ort
-import argparse
-import json
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+import onnxruntime
 import time
-import tyro
-import subprocess
-
-# Add the project root to Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Add the src directory to Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-
-from src.config.argument_config import ArgumentConfig
-from src.config.inference_config import InferenceConfig
-from src.config.crop_config import CropConfig
-from src.utils.cropper import Cropper
-from src.utils.camera import get_rotation_matrix
-from src.utils.video import images2video, get_fps, add_audio_to_video, has_audio_stream
-from src.utils.crop import prepare_paste_back, paste_back
-from src.utils.io import load_image_rgb, load_video, resize_to_limit, dump, load
-from src.utils.helper import mkdir, basename, is_video, is_template, remove_suffix, is_image, calc_motion_multiplier
-from src.utils.filter import smooth
-from src.utils.retargeting_utils import calc_eye_close_ratio, calc_lip_close_ratio
-from src.utils.camera import headpose_pred_to_degree
-from src.utils.rprint import rlog as log
-
-# NumPy versions of camera functions for ONNX compatibility
-def headpose_pred_to_degree_numpy(pred: np.ndarray) -> np.ndarray:
-    """
-    NumPy version of headpose_pred_to_degree for ONNX compatibility
-    pred: (bs, 66) or (bs, 1) or others
-    """
-    if pred.ndim > 1 and pred.shape[1] == 66:
-        # NOTE: note that the average is modified to 97.5
-        idx_tensor = np.arange(0, 66, dtype=np.float32)
-        pred_softmax = np.exp(pred) / np.sum(np.exp(pred), axis=1, keepdims=True)  # softmax
-        degree = np.sum(pred_softmax * idx_tensor, axis=1) * 3 - 97.5
-        return degree
-
-    return pred
+from utils_crop import face_align, trans_points2d, distance2bbox, distance2kps, nms_boxes,\
+                        crop_image, softmax, calculate_distance_ratio, get_rotation_matrix,\
+                        transform_keypoint, concat_frame, prepare_paste_back, paste_back
 
 
-def get_rotation_matrix_numpy(pitch_: np.ndarray, yaw_: np.ndarray, roll_: np.ndarray) -> np.ndarray:
-    """
-    NumPy version of get_rotation_matrix for ONNX compatibility
-    the input is in degree
-    """
-    PI = np.pi
+def get_face_analysis(det_face, landmark):
 
-    # transform to radian
-    pitch = pitch_ / 180 * PI
-    yaw = yaw_ / 180 * PI
-    roll = roll_ / 180 * PI
+    def get_landmark(img, face):
+        input_size = 192
 
-    if pitch.ndim == 1:
-        pitch = pitch[:, None]
-    if yaw.ndim == 1:
-        yaw = yaw[:, None]
-    if roll.ndim == 1:
-        roll = roll[:, None]
+        bbox = face["bbox"]
+        w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+        center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
+        rotate = 0
+        _scale = input_size / (max(w, h) * 1.5)
+        aimg, M = face_align(img, center, input_size, _scale, rotate)
+        input_size = tuple(aimg.shape[0:2][::-1])
 
-    # calculate the euler matrix
-    bs = pitch.shape[0]
-    ones = np.ones([bs, 1])
-    zeros = np.zeros([bs, 1])
-    x, y, z = pitch, yaw, roll
+        aimg = aimg.transpose(2, 0, 1)  # HWC -> CHW
+        aimg = np.expand_dims(aimg, axis=0)
+        aimg = aimg.astype(np.float32)
 
-    rot_x = np.concatenate([
-        ones, zeros, zeros,
-        zeros, np.cos(x), -np.sin(x),
-        zeros, np.sin(x), np.cos(x)
-    ], axis=1).reshape([bs, 3, 3])
+        # feedforward
+        output = landmark.run(None, {"data": aimg})
+        pred = output[0][0]
 
-    rot_y = np.concatenate([
-        np.cos(y), zeros, np.sin(y),
-        zeros, ones, zeros,
-        -np.sin(y), zeros, np.cos(y)
-    ], axis=1).reshape([bs, 3, 3])
+        pred = pred.reshape((-1, 2))
+        pred[:, 0:2] += 1
+        pred[:, 0:2] *= input_size[0] // 2
 
-    rot_z = np.concatenate([
-        np.cos(z), -np.sin(z), zeros,
-        np.sin(z), np.cos(z), zeros,
-        zeros, zeros, ones
-    ], axis=1).reshape([bs, 3, 3])
+        IM = cv2.invertAffineTransform(M)
+        pred = trans_points2d(pred, IM)
 
-    rot = rot_z @ rot_y @ rot_x
-    return np.transpose(rot, (0, 2, 1))  # transpose
+        return pred
 
+    def face_analysis(img):
+        input_size = 512
 
-def partial_fields(target_class, kwargs):
-    return target_class(**{k: v for k, v in kwargs.items() if hasattr(target_class, k)})
+        im_ratio = float(img.shape[0]) / img.shape[1]
+        if im_ratio > 1:
+            new_height = input_size
+            new_width = int(new_height / im_ratio)
+        else:
+            new_width = input_size
+            new_height = int(new_width * im_ratio)
+        det_scale = float(new_height) / img.shape[0]
+        resized_img = cv2.resize(img, (new_width, new_height))
+        det_img = np.zeros((input_size, input_size, 3), dtype=np.uint8)
+        det_img[:new_height, :new_width, :] = resized_img
 
+        det_img = (det_img - 127.5) / 128
+        det_img = det_img.transpose(2, 0, 1)  # HWC -> CHW
+        det_img = np.expand_dims(det_img, axis=0)
+        det_img = det_img.astype(np.float32)
 
-def fast_check_ffmpeg():
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        return True
-    except:
-        return False
+        # feedforward
+        output = det_face.run(None, {"input.1": det_img})
 
+        scores_list = []
+        bboxes_list = []
+        kpss_list = []
 
-def fast_check_args(args: ArgumentConfig):
-    if not osp.exists(args.source):
-        raise FileNotFoundError(f"source info not found: {args.source}")
-    if not osp.exists(args.driving):
-        raise FileNotFoundError(f"driving info not found: {args.driving}")
+        det_thresh = 0.5
+        fmc = 3
+        feat_stride_fpn = [8, 16, 32]
+        center_cache = {}
+        for idx, stride in enumerate(feat_stride_fpn):
+            scores = output[idx]
+            bbox_preds = output[idx + fmc]
+            bbox_preds = bbox_preds * stride
+            kps_preds = output[idx + fmc * 2] * stride
+            height = input_size // stride
+            width = input_size // stride
+            K = height * width
+            key = (height, width, stride)
+            if key in center_cache:
+                anchor_centers = center_cache[key]
+            else:
+                anchor_centers = np.stack(
+                    np.mgrid[:height, :width][::-1], axis=-1
+                ).astype(np.float32)
 
+                anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+                num_anchors = 2
+                anchor_centers = np.stack(
+                    [anchor_centers] * num_anchors, axis=1
+                ).reshape((-1, 2))
+                if len(center_cache) < 100:
+                    center_cache[key] = anchor_centers
 
-class ONNXLivePortraitPipeline:
-    """ONNX-based LivePortrait pipeline that mimics LivePortraitPipeline"""
+            pos_inds = np.where(scores >= det_thresh)[0]
+            bboxes = distance2bbox(anchor_centers, bbox_preds)
+            pos_scores = scores[pos_inds]
+            pos_bboxes = bboxes[pos_inds]
+            scores_list.append(pos_scores)
+            bboxes_list.append(pos_bboxes)
 
-    def __init__(self, inference_cfg: InferenceConfig, crop_cfg: CropConfig, model_dir: str = "./onnx_models"):
-        self.inference_cfg = inference_cfg
-        self.crop_cfg = crop_cfg
-        self.model_dir = model_dir
+            kpss = distance2kps(anchor_centers, kps_preds)
+            kpss = kpss.reshape((kpss.shape[0], -1, 2))
+            pos_kpss = kpss[pos_inds]
+            kpss_list.append(pos_kpss)
 
-        # Initialize ONNX runtime
-        providers = ['CPUExecutionProvider']
-        if inference_cfg.device_id >= 0 and not inference_cfg.flag_force_cpu:
-            try:
-                providers = [('CUDAExecutionProvider', {'device_id': inference_cfg.device_id}), 'CPUExecutionProvider']
-            except:
-                pass
+        scores = np.vstack(scores_list)
+        scores_ravel = scores.ravel()
+        order = scores_ravel.argsort()[::-1]
+        bboxes = np.vstack(bboxes_list) / det_scale
+        kpss = np.vstack(kpss_list) / det_scale
+        pre_det = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
+        pre_det = pre_det[order, :]
 
-        log(f"Using ONNX providers: {[p if isinstance(p, str) else p[0] for p in providers]}")
+        nms_thresh = 0.4
+        keep = nms_boxes(pre_det, [1 for s in pre_det], nms_thresh)
+        bboxes = pre_det[keep, :]
+        kpss = kpss[order, :, :]
+        kpss = kpss[keep, :, :]
 
-        # Load ONNX models
-        self.load_onnx_models(providers)
+        if bboxes.shape[0] == 0:
+            return []
 
-        # Initialize cropper
-        self.cropper = Cropper(
-            crop_cfg=crop_cfg,
-            flag_force_cpu=inference_cfg.flag_force_cpu,
-            device_id=inference_cfg.device_id
+        ret = []
+        for i in range(bboxes.shape[0]):
+            bbox = bboxes[i, 0:4]
+            det_score = bboxes[i, 4]
+            kps = None
+            if kpss is not None:
+                kps = kpss[i]
+            face = dict(bbox=bbox, kps=kps, det_score=det_score)
+            lmk = get_landmark(img, face)
+            face["landmark_2d_106"] = lmk
+
+            ret.append(face)
+
+        src_face = sorted(
+            ret,
+            key=lambda face: (face["bbox"][2] - face["bbox"][0])
+            * (face["bbox"][3] - face["bbox"][1]),
+            reverse=True,
         )
 
-        log("✓ ONNX LivePortrait pipeline initialized successfully")
+        return src_face
 
-    def get_model_path(self, model_name: str, model_type: str = "human") -> str:
-        """Get path to ONNX model"""
-        if model_type == "animal":
-            return osp.join(self.model_dir, "animal", f"{model_name}.onnx")
-        return osp.join(self.model_dir, f"{model_name}.onnx")
+    return face_analysis
 
-    def load_onnx_models(self, providers):
-        """Load all ONNX models"""
-        log("Loading ONNX models...")
 
-        # Load main models
-        appearance_model_path = self.get_model_path("appearance_feature_extractor")
-        motion_model_path = self.get_model_path("motion_extractor")
-        warping_model_path = self.get_model_path("warping_network")
-        generator_model_path = self.get_model_path("spade_generator")
+def preprocess(img):
+    img = img / 255.0
+    img = np.clip(img, 0, 1)  # clip to 0~1
+    img = img.transpose(2, 0, 1)  # HxWx3x1 -> 1x3xHxW
+    img = np.expand_dims(img, axis=0)
+    img = img.astype(np.float32)
 
-        log(f"Loading Appearance Feature Extractor from {appearance_model_path}")
-        self.appearance_feature_extractor_session = ort.InferenceSession(appearance_model_path, providers=providers)
+    return img
 
-        log(f"Loading Motion Extractor from {motion_model_path}")
-        self.motion_extractor_session = ort.InferenceSession(motion_model_path, providers=providers)
 
-        log(f"Loading Warping Network from {warping_model_path}")
-        self.warping_network_session = ort.InferenceSession(warping_model_path, providers=providers)
+def src_preprocess(img):
+    h, w = img.shape[:2]
 
-        log(f"Loading SPADE Generator from {generator_model_path}")
-        self.spade_generator_session = ort.InferenceSession(generator_model_path, providers=providers)
+    # ajust the size of the image according to the maximum dimension
+    max_dim = 1280
+    if max(h, w) > max_dim:
+        if h > w:
+            new_h = max_dim
+            new_w = int(w * (max_dim / h))
+        else:
+            new_w = max_dim
+            new_h = int(h * (max_dim / w))
+        img = cv2.resize(img, (new_w, new_h))
 
-        # Load stitching models if available
-        self.stitching_sessions = {}
-        stitching_dir = osp.join(self.model_dir, "stitching")
-        if osp.exists(stitching_dir):
-            for model_name in ["stitching", "eye", "lip"]:
-                model_path = osp.join(stitching_dir, f"{model_name}.onnx")
-                if osp.exists(model_path):
-                    self.stitching_sessions[model_name] = ort.InferenceSession(model_path, providers=providers)
+    # ensure that the image dimensions are multiples of n
+    division = 2
+    new_h = img.shape[0] - (img.shape[0] % division)
+    new_w = img.shape[1] - (img.shape[1] % division)
 
-        log("✓ All ONNX models loaded successfully")
-
-    def prepare_source(self, img: np.ndarray) -> np.ndarray:
-        """Prepare source image for inference"""
-        # Resize to 256x256 for ONNX models
-        if img.shape[:2] != (256, 256):
-            img = cv2.resize(img, (256, 256))
-
-        if img.ndim == 3:
-            img = img[None, ...]  # Add batch dimension
-
-        # NO BGR/RGB conversion - keep the input format (RGB from load_image_rgb)
-        # Normalize and transpose to match PyTorch version exactly
-        img = img.astype(np.float32) / 255.0
-        img = np.clip(img, 0, 1)  # clip to 0~1
-        img = np.transpose(img, (0, 3, 1, 2))  # BHWC -> BCHW
-
+    if new_h == 0 or new_w == 0:
+        # when the width or height is less than n, no need to process
         return img
 
-    def extract_feature_3d(self, x: np.ndarray) -> np.ndarray:
-        """Extract 3D features using ONNX model"""
-        input_name = self.appearance_feature_extractor_session.get_inputs()[0].name
-        output = self.appearance_feature_extractor_session.run(None, {input_name: x})
-        return output[0]
-
-    def get_kp_info(self, x: np.ndarray) -> Dict[str, np.ndarray]:
-        """Get keypoint info using ONNX model"""
-        input_name = self.motion_extractor_session.get_inputs()[0].name
-        outputs = self.motion_extractor_session.run(None, {input_name: x})
-
-        # Map outputs to keys
-        output_names = [out.name for out in self.motion_extractor_session.get_outputs()]
-        kp_info = dict(zip(output_names, outputs))
-
-        # Process outputs to match PyTorch version format
-        bs = kp_info['kp'].shape[0]
-        kp_info['pitch'] = headpose_pred_to_degree_numpy(kp_info['pitch'])
-        kp_info['yaw'] = headpose_pred_to_degree_numpy(kp_info['yaw'])
-        kp_info['roll'] = headpose_pred_to_degree_numpy(kp_info['roll'])
-        kp_info['kp'] = kp_info['kp'].reshape(bs, -1, 3)  # BxNx3
-        kp_info['exp'] = kp_info['exp'].reshape(bs, -1, 3)  # BxNx3
-
-        return kp_info
-
-    def transform_keypoint(self, kp_info: Dict[str, np.ndarray]) -> np.ndarray:
-        """Transform keypoints using pose and expression"""
-        kp = kp_info['kp']  # (bs, k, 3)
-        pitch, yaw, roll = kp_info['pitch'], kp_info['yaw'], kp_info['roll']
-        t, exp = kp_info['t'], kp_info['exp']
-        scale = kp_info['scale']
-
-        bs = kp.shape[0]
-        if kp.ndim == 2:
-            num_kp = kp.shape[1] // 3  # Bx(num_kpx3)
-        else:
-            num_kp = kp.shape[1]  # Bxnum_kpx3
-
-        # Get rotation matrix
-        rot_matrix = get_rotation_matrix_numpy(pitch, yaw, roll)  # (bs, 3, 3)
-
-        # Apply transformations
-        kp_transformed = kp.reshape(bs, num_kp, 3) @ rot_matrix + exp.reshape(bs, num_kp, 3)
-        kp_transformed *= scale[..., None]  # (bs, k, 3) * (bs, 1, 1) = (bs, k, 3)
-        kp_transformed[:, :, 0:2] += t[:, None, 0:2]  # remove z, only apply tx ty
-
-        return kp_transformed.reshape(bs, -1)
-
-    def warp_decode(self, feature_3d: np.ndarray, kp_source: np.ndarray, kp_driving: np.ndarray) -> np.ndarray:
-        """Warp features and decode using ONNX models"""
-        # Ensure keypoints are in correct 3D shape (batch, 21, 3)
-        if kp_driving.ndim == 2:
-            kp_driving = kp_driving.reshape(kp_driving.shape[0], -1, 3)
-        if kp_source.ndim == 2:
-            kp_source = kp_source.reshape(kp_source.shape[0], -1, 3)
-
-        # Use warping network - now with full dense motion in ONNX
-        input_names = [inp.name for inp in self.warping_network_session.get_inputs()]
-        inputs = {
-            input_names[0]: feature_3d,     # feature_3d
-            input_names[1]: kp_driving,     # kp_driving
-            input_names[2]: kp_source       # kp_source
-        }
-
-        warping_outputs = self.warping_network_session.run(None, inputs)
-        warped_feature = warping_outputs[0]  # Final output from warping network
-
-        # Use SPADE generator
-        spade_input_name = self.spade_generator_session.get_inputs()[0].name
-        spade_output = self.spade_generator_session.run(None, {spade_input_name: warped_feature})
-
-        return spade_output[0]
-
-    def retarget_eye(self, kp_source: np.ndarray, eye_close_ratio: float) -> np.ndarray:
-        """Retarget eye using ONNX model if available"""
-        if 'eye' not in self.stitching_sessions:
-            return kp_source
-
-        # Prepare input: kp_source + eye_close_ratio
-        bs = kp_source.shape[0]
-        kp_flat = kp_source.reshape(bs, -1)  # (bs, 63)
-        eye_input = np.concatenate([kp_flat, np.array([[eye_close_ratio]] * bs),
-                                   np.array([[eye_close_ratio]] * bs),
-                                   np.array([[eye_close_ratio]] * bs)], axis=1)  # (bs, 66)
-
-        input_name = self.stitching_sessions['eye'].get_inputs()[0].name
-        output = self.stitching_sessions['eye'].run(None, {input_name: eye_input})
-
-        return output[0].reshape(bs, -1, 3)
-
-    def retarget_lip(self, kp_source: np.ndarray, lip_close_ratio: float) -> np.ndarray:
-        """Retarget lip using ONNX model if available"""
-        if 'lip' not in self.stitching_sessions:
-            return kp_source
-
-        # Prepare input: kp_source + lip_close_ratio
-        bs = kp_source.shape[0]
-        kp_flat = kp_source.reshape(bs, -1)  # (bs, 63)
-        lip_input = np.concatenate([kp_flat, np.array([[lip_close_ratio]] * bs),
-                                   np.array([[lip_close_ratio]] * bs)], axis=1)  # (bs, 65)
-
-        input_name = self.stitching_sessions['lip'].get_inputs()[0].name
-        output = self.stitching_sessions['lip'].run(None, {input_name: lip_input})
-
-        return output[0].reshape(bs, -1, 3)
-
-    def stitching(self, kp_source: np.ndarray, kp_driving: np.ndarray) -> np.ndarray:
-        """Stitch keypoints using ONNX model if available"""
-        if 'stitching' not in self.stitching_sessions:
-            return kp_driving
-
-        # Prepare input: concatenate kp_source and kp_driving
-        bs = kp_source.shape[0]
-        kp_source_flat = kp_source.reshape(bs, -1)  # (bs, 63)
-        kp_driving_flat = kp_driving.reshape(bs, -1)  # (bs, 63)
-        stitching_input = np.concatenate([kp_source_flat, kp_driving_flat], axis=1)  # (bs, 126)
-
-        input_name = self.stitching_sessions['stitching'].get_inputs()[0].name
-        output = self.stitching_sessions['stitching'].run(None, {input_name: stitching_input})
-
-        # Output includes delta_tx, delta_ty, plus keypoints
-        delta_tx_ty = output[0][:, :2]  # (bs, 2)
-        kp_stitched = output[0][:, 2:].reshape(bs, -1, 3)  # (bs, 21, 3)
-
-        # Apply translation
-        kp_stitched[..., :2] += delta_tx_ty[..., None, :]
-
-        return kp_stitched
-
-    def parse_output(self, out: np.ndarray) -> np.ndarray:
-        """Parse network output to image"""
-        out = np.transpose(out, (0, 2, 3, 1))  # 1x3xHxW -> 1xHxWx3
-        out = np.clip(out, 0, 1)
-        out = (out * 255).astype(np.uint8)
-        return out[0]  # Remove batch dimension
-
-    def calc_ratio(self, lmk_lst: List[np.ndarray]) -> Tuple[List[float], List[float]]:
-        """Calculate eye and lip close ratios from landmarks"""
-        c_d_eyes_lst = []
-        c_d_lip_lst = []
-
-        for i, lmk in enumerate(lmk_lst):
-            # The retargeting functions expect landmarks in shape (batch, num_points, 2)
-            # NOT flattened coordinates. They use point indices to access specific landmarks
-            if lmk.ndim == 2 and lmk.shape[1] == 2:
-                # Add batch dimension: (num_points, 2) -> (1, num_points, 2)
-                lmk_batch = lmk[None, ...]  # Shape: (1, 203, 2)
-            else:
-                # Already has batch dimension or different format
-                lmk_batch = lmk
-
-            c_d_eyes = calc_eye_close_ratio(lmk_batch)
-            c_d_lip = calc_lip_close_ratio(lmk_batch)
-            c_d_eyes_lst.append(c_d_eyes)
-            c_d_lip_lst.append(c_d_lip)
-
-        return c_d_eyes_lst, c_d_lip_lst
-
-    def make_motion_template(self, I_lst: np.ndarray, c_eyes_lst: List[float], c_lip_lst: List[float], output_fps: int = 25) -> Dict:
-        """Create motion template using ONNX models"""
-        n_frames = I_lst.shape[0]
-        template_dct = {
-            'n_frames': n_frames,
-            'output_fps': output_fps,
-            'motion': [],
-            'c_eyes_lst': [],
-            'c_lip_lst': [],
-        }
-
-        for i in range(n_frames):
-            if i % 10 == 0 or i == n_frames - 1:
-                log(f"Processing frame {i+1}/{n_frames}")
-
-            # Get keypoint info using ONNX model
-            I_i = I_lst[i:i+1]  # Keep batch dimension
-            x_i_info = self.get_kp_info(I_i)
-            x_s = self.transform_keypoint(x_i_info)
-
-            # Get rotation matrix
-            R_i = get_rotation_matrix_numpy(x_i_info['pitch'], x_i_info['yaw'], x_i_info['roll'])
-
-            item_dct = {
-                'scale': x_i_info['scale'].astype(np.float32),
-                'R': R_i.astype(np.float32),
-                'exp': x_i_info['exp'].astype(np.float32),
-                't': x_i_info['t'].astype(np.float32),
-                'kp': x_i_info['kp'].astype(np.float32),
-                'x_s': x_s.astype(np.float32),
-            }
-
-            template_dct['motion'].append(item_dct)
-            template_dct['c_eyes_lst'].append(c_eyes_lst[i])
-            template_dct['c_lip_lst'].append(c_lip_lst[i])
-
-        return template_dct
-
-    def execute(self, args: ArgumentConfig):
-        """Main execution function - matches LivePortraitPipeline.execute()"""
-        log("Starting ONNX LivePortrait inference...")
-
-        ######## Load source input ########
-        flag_is_source_video = False
-        source_fps = None
-
-        if is_image(args.source):
-            flag_is_source_video = False
-            img_rgb = load_image_rgb(args.source)
-            img_rgb = resize_to_limit(img_rgb, self.inference_cfg.source_max_dim, self.inference_cfg.source_division)
-            log(f"Load source image from {args.source}")
-            source_rgb_lst = [img_rgb]
-        elif is_video(args.source):
-            flag_is_source_video = True
-            source_rgb_lst = load_video(args.source)
-            source_rgb_lst = [resize_to_limit(img, self.inference_cfg.source_max_dim, self.inference_cfg.source_division) for img in source_rgb_lst]
-            source_fps = int(get_fps(args.source))
-            log(f"Load source video from {args.source}, FPS is {source_fps}")
-        else:
-            raise Exception(f"Unknown source format: {args.source}")
-
-        ######## Process driving info ########
-        flag_load_from_template = is_template(args.driving)
-        driving_rgb_crop_256x256_lst = None
-        wfp_template = None
-
-        if flag_load_from_template:
-            log(f"Load from template: {args.driving}")
-            driving_template_dct = load(args.driving)
-            c_d_eyes_lst = driving_template_dct.get('c_eyes_lst', driving_template_dct.get('c_d_eyes_lst', []))
-            c_d_lip_lst = driving_template_dct.get('c_lip_lst', driving_template_dct.get('c_d_lip_lst', []))
-            driving_n_frames = driving_template_dct['n_frames']
-            flag_is_driving_video = True if driving_n_frames > 1 else False
-
-            if flag_is_source_video and flag_is_driving_video:
-                n_frames = min(len(source_rgb_lst), driving_n_frames)
-            elif flag_is_source_video and not flag_is_driving_video:
-                n_frames = len(source_rgb_lst)
-            else:
-                n_frames = driving_n_frames
-
-            output_fps = driving_template_dct.get('output_fps', self.inference_cfg.output_fps)
-            log(f'The FPS of template: {output_fps}')
-
-        elif osp.exists(args.driving):
-            if is_video(args.driving):
-                flag_is_driving_video = True
-                output_fps = int(get_fps(args.driving))
-                log(f"Load driving video from: {args.driving}, FPS is {output_fps}")
-                driving_rgb_lst = load_video(args.driving)
-            elif is_image(args.driving):
-                flag_is_driving_video = False
-                driving_img_rgb = load_image_rgb(args.driving)
-                output_fps = 25
-                log(f"Load driving image from {args.driving}")
-                driving_rgb_lst = [driving_img_rgb]
-            else:
-                raise Exception(f"{args.driving} is not a supported type!")
-
-            # Make motion template using ONNX models
-            log("Start making driving motion template...")
-            driving_n_frames = len(driving_rgb_lst)
-
-            if flag_is_source_video and flag_is_driving_video:
-                n_frames = min(len(source_rgb_lst), driving_n_frames)
-                driving_rgb_lst = driving_rgb_lst[:n_frames]
-            elif flag_is_source_video and not flag_is_driving_video:
-                n_frames = len(source_rgb_lst)
-            else:
-                n_frames = driving_n_frames
-
-            # Crop driving video
-            if self.inference_cfg.flag_crop_driving_video or not is_video(args.driving):
-                ret_d = self.cropper.crop_driving_video(driving_rgb_lst)
-                log(f'Driving video is cropped, {len(ret_d["frame_crop_lst"])} frames are processed.')
-                if len(ret_d["frame_crop_lst"]) != n_frames and flag_is_driving_video:
-                    n_frames = min(n_frames, len(ret_d["frame_crop_lst"]))
-                driving_rgb_crop_lst, driving_lmk_crop_lst = ret_d['frame_crop_lst'], ret_d['lmk_crop_lst']
-                driving_rgb_crop_256x256_lst = [cv2.resize(frame, (256, 256)) for frame in driving_rgb_crop_lst]
-            else:
-                driving_lmk_crop_lst = self.cropper.calc_lmks_from_cropped_video(driving_rgb_lst)
-                driving_rgb_crop_256x256_lst = [cv2.resize(frame, (256, 256)) for frame in driving_rgb_lst]
-
-            c_d_eyes_lst, c_d_lip_lst = self.calc_ratio(driving_lmk_crop_lst)
-
-            # Prepare driving frames for ONNX inference
-            I_d_lst = np.array([self.prepare_source(frame) for frame in driving_rgb_crop_256x256_lst])
-            I_d_lst = np.squeeze(I_d_lst, axis=1)  # Remove extra dimension
-
-            driving_template_dct = self.make_motion_template(I_d_lst, c_d_eyes_lst, c_d_lip_lst, output_fps=output_fps)
-
-            wfp_template = remove_suffix(args.driving) + '.pkl'
-            dump(wfp_template, driving_template_dct)
-            log(f"Dump motion template to {wfp_template}")
-        else:
-            raise Exception(f"{args.driving} does not exist!")
-
-        if not flag_is_driving_video:
-            c_d_eyes_lst = c_d_eyes_lst * n_frames
-            c_d_lip_lst = c_d_lip_lst * n_frames
-
-        ######## Process source and generate results ########
-        I_p_lst = []
-
-        if flag_is_source_video:
-            log("Processing source video...")
-            source_rgb_lst = source_rgb_lst[:n_frames]
-
-            if self.inference_cfg.flag_do_crop:
-                ret_s = self.cropper.crop_source_video(source_rgb_lst, self.crop_cfg)
-                log(f'Source video is cropped, {len(ret_s["frame_crop_lst"])} frames are processed.')
-                if len(ret_s["frame_crop_lst"]) != n_frames:
-                    n_frames = min(n_frames, len(ret_s["frame_crop_lst"]))
-                source_rgb_crop_lst = ret_s['frame_crop_lst']
-            else:
-                source_rgb_crop_lst = [cv2.resize(frame, (256, 256)) for frame in source_rgb_lst]
-
-            # Extract source features once (first frame)
-            source_prepared = self.prepare_source(source_rgb_crop_lst[0])
-            source_feature_3d = self.extract_feature_3d(source_prepared)
-            source_kp_info = self.get_kp_info(source_prepared)
-            source_kp = source_kp_info['kp'].reshape(1, -1, 3)
-
-        else:
-            # Single source image
-            if self.inference_cfg.flag_do_crop:
-                ret_s = self.cropper.crop_source_image(source_rgb_lst[0], self.crop_cfg)
-                source_rgb_crop = ret_s['img_crop']
-            else:
-                source_rgb_crop = cv2.resize(source_rgb_lst[0], (256, 256))
-
-            source_prepared = self.prepare_source(source_rgb_crop)
-            source_feature_3d = self.extract_feature_3d(source_prepared)
-            source_kp_info = self.get_kp_info(source_prepared)
-            source_kp = source_kp_info['kp'].reshape(1, -1, 3)
-
-        # Generate animated frames
-        log("Generating animated frames...")
-        for i in range(n_frames):
-            if i % 10 == 0 or i == n_frames - 1:
-                log(f"Processing frame {i+1}/{n_frames}")
-
-            # Get driving motion
-            motion = driving_template_dct['motion'][i]
-            driving_kp = motion['kp'].reshape(1, -1, 3)
-
-            # Apply retargeting if enabled
-            if self.inference_cfg.flag_eye_retargeting:
-                driving_kp = self.retarget_eye(driving_kp, c_d_eyes_lst[i][0][0])
-
-            if self.inference_cfg.flag_lip_retargeting:
-                driving_kp = self.retarget_lip(driving_kp, c_d_lip_lst[i][0])
-
-            # Apply stitching if enabled
-            if self.inference_cfg.flag_stitching:
-                driving_kp = self.stitching(source_kp, driving_kp)
-
-            # Generate frame
-            out = self.warp_decode(source_feature_3d, source_kp.reshape(1, -1), driving_kp.reshape(1, -1))
-            I_p = self.parse_output(out)
-            I_p_lst.append(I_p)
-
-        ######## Paste back and save result ########
-        # Create output filename with "_onnx" suffix
-        source_name = osp.splitext(osp.basename(args.source))[0]
-        driving_name = osp.splitext(osp.basename(args.driving))[0]
-        output_name = f"{source_name}_onnx_{driving_name}.mp4"
-        wfp_concat = osp.join(args.output_dir, output_name)
-
-        # Ensure output directory exists
-        os.makedirs(args.output_dir, exist_ok=True)
-
-        if args.flag_pasteback and args.flag_do_crop:
-            # Paste back processing
-            log("Pasting back...")
-            I_p_pstbk_lst = []
-
-            if flag_is_source_video:
-                for i, I_p_i in enumerate(I_p_lst):
-                    source_rgb_i = source_rgb_lst[i]
-                    crop_M_c2o = ret_s['M_c2o_lst'][i]
-                    mask_ori = prepare_paste_back(self.inference_cfg.mask_crop, crop_M_c2o,
-                                                dsize=(source_rgb_i.shape[1], source_rgb_i.shape[0]))
-                    I_p_pstbk = paste_back(I_p_i, crop_M_c2o, source_rgb_i, mask_ori)
-                    I_p_pstbk_lst.append(I_p_pstbk)
-            else:
-                # Single source image
-                crop_M_c2o = ret_s['M_c2o']
-                source_rgb = source_rgb_lst[0]
-                mask_ori = prepare_paste_back(self.inference_cfg.mask_crop, crop_M_c2o,
-                                            dsize=(source_rgb.shape[1], source_rgb.shape[0]))
-                for I_p_i in I_p_lst:
-                    I_p_pstbk = paste_back(I_p_i, crop_M_c2o, source_rgb, mask_ori)
-                    I_p_pstbk_lst.append(I_p_pstbk)
-
-            wfp_concat = images2video(I_p_pstbk_lst, wfp_concat, fps=output_fps)
-        else:
-            wfp_concat = images2video(I_p_lst, wfp_concat, fps=output_fps)
-
-        log(f"Saving result to {wfp_concat}")
-        log("✅ ONNX inference completed!")
-        return wfp_concat
-
-
-def main():
-    # set tyro theme
-    tyro.extras.set_accent_color("bright_cyan")
-    args = tyro.cli(ArgumentConfig)
-
-    ffmpeg_dir = os.path.join(os.getcwd(), "ffmpeg")
-    if osp.exists(ffmpeg_dir):
-        os.environ["PATH"] += (os.pathsep + ffmpeg_dir)
-
-    if not fast_check_ffmpeg():
-        raise ImportError(
-            "FFmpeg is not installed. Please install FFmpeg (including ffmpeg and ffprobe) before running this script. https://ffmpeg.org/download.html"
-        )
-
-    fast_check_args(args)
-
-    # specify configs for inference
-    inference_cfg = partial_fields(InferenceConfig, args.__dict__)
-    crop_cfg = partial_fields(CropConfig, args.__dict__)
-
-    onnx_pipeline = ONNXLivePortraitPipeline(
-        inference_cfg=inference_cfg,
-        crop_cfg=crop_cfg,
-        model_dir="./onnx_models"
+    if new_h != img.shape[0] or new_w != img.shape[1]:
+        img = img[:new_h, :new_w]
+
+    return img
+
+
+def crop_src_image(models, img):
+    face_analysis = models["face_analysis"]
+    src_face = face_analysis(img)
+
+    if len(src_face) == 0:
+        print("No face detected in the source image.")
+        return None
+    elif len(src_face) > 1:
+        print(f"More than one face detected in the image, only pick one face.")
+
+    src_face = src_face[0]
+    lmk = src_face["landmark_2d_106"]  # this is the 106 landmarks from insightface
+
+    # crop the face
+    crop_info = crop_image(img, lmk, dsize=512, scale=2.3, vy_ratio=-0.125)
+
+    lmk = landmark_runner(models, img, lmk)
+
+    crop_info["lmk_crop"] = lmk
+    crop_info["img_crop_256x256"] = cv2.resize(
+        crop_info["img_crop"], (256, 256), interpolation=cv2.INTER_AREA
+    )
+    crop_info["lmk_crop_256x256"] = crop_info["lmk_crop"] * 256 / 512
+
+    return crop_info
+
+
+def landmark_runner(models, img, lmk):
+    crop_dct = crop_image(img, lmk, dsize=224, scale=1.5, vy_ratio=-0.1)
+    img_crop = crop_dct["img_crop"]
+
+    img_crop = img_crop / 255
+    img_crop = img_crop.transpose(2, 0, 1)  # HWC -> CHW
+    img_crop = np.expand_dims(img_crop, axis=0)
+    img_crop = img_crop.astype(np.float32)
+
+    # feedforward
+    net = models["landmark_runner"]
+    output = net.run(None, {"input": img_crop})
+    out_pts = output[2]
+
+    # 2d landmarks 203 points
+    lmk = out_pts[0].reshape(-1, 2) * 224  # scale to 0-224
+    # _transform_pts
+    M = crop_dct["M_c2o"]
+    lmk = lmk @ M[:2, :2].T + M[:2, 2]
+
+    return lmk
+
+
+def extract_feature_3d(models, x):
+    net = models["appearance_feature_extractor"]
+
+    # feedforward
+    output = net.run(None, {"img": x})
+    f_s = output[0]
+    f_s = f_s.astype(np.float32)
+
+    return f_s
+
+
+def get_kp_info(models, x):
+    net = models["motion_extractor"]
+
+    # feedforward
+    output = net.run(None, {"img": x})
+    pitch, yaw, roll, t, exp, scale, kp = output
+
+    kp_info = dict(pitch=pitch, yaw=yaw, roll=roll, t=t, exp=exp, scale=scale, kp=kp)
+
+    pred = softmax(kp_info["pitch"], axis=1)
+    degree = np.sum(pred * np.arange(66), axis=1) * 3 - 97.5
+    kp_info["pitch"] = degree[:, None]  # Bx1
+    pred = softmax(kp_info["yaw"], axis=1)
+    degree = np.sum(pred * np.arange(66), axis=1) * 3 - 97.5
+    kp_info["yaw"] = degree[:, None]  # Bx1
+    pred = softmax(kp_info["roll"], axis=1)
+    degree = np.sum(pred * np.arange(66), axis=1) * 3 - 97.5
+    kp_info["roll"] = degree[:, None]  # Bx1
+
+    kp_info = {k: v.astype(np.float32) for k, v in kp_info.items()}
+
+    bs = kp_info["kp"].shape[0]
+    kp_info["kp"] = kp_info["kp"].reshape(bs, -1, 3)  # BxNx3
+    kp_info["exp"] = kp_info["exp"].reshape(bs, -1, 3)  # BxNx3
+
+    return kp_info
+
+
+def stitching(models, kp_source, kp_driving):
+    """conduct the stitching
+    kp_source: Bxnum_kpx3
+    kp_driving: Bxnum_kpx3
+    """
+
+    bs, num_kp = kp_source.shape[:2]
+
+    kp_driving_new = kp_driving
+
+    bs_src = kp_source.shape[0]
+    bs_dri = kp_driving.shape[0]
+    feat = np.concatenate(
+        [kp_source.reshape(bs_src, -1), kp_driving.reshape(bs_dri, -1)], axis=1
     )
 
-    # run
-    onnx_pipeline.execute(args)
+    # feedforward
+    net = models["stitching"]
+    output = net.run(None, {"input": feat})
+    delta = output[0]
+
+    delta_exp = delta[..., : 3 * num_kp].reshape(bs, num_kp, 3)  # 1x20x3
+    delta_tx_ty = delta[..., 3 * num_kp : 3 * num_kp + 2].reshape(bs, 1, 2)  # 1x1x2
+
+    kp_driving_new += delta_exp
+    kp_driving_new[..., :2] += delta_tx_ty
+
+    return kp_driving_new
 
 
-if __name__ == "__main__":
-    main()
+def warping_spade(models, feature_3d, kp_source, kp_driving):
+    """get the image after the warping of the implicit keypoints
+    feature_3d: Bx32x16x64x64, feature volume
+    kp_source: BxNx3
+    kp_driving: BxNx3
+    """
+
+    # feedforward
+    net = models["warping_spade"]
+    output = net.run(
+            None,
+            {
+                "feature_3d": feature_3d,
+                "kp_driving": kp_driving,
+                "kp_source": kp_source,
+            },
+        )
+    return output[0]
+
+
+def predict(frame_id, models, x_s_info, R_s, f_s, x_s, img, pred_info):
+    # calc_lmks_from_cropped_video
+    frame_0 = pred_info['lmk'] is None
+    if frame_0:
+        face_analysis = models["face_analysis"]
+        src_face = face_analysis(img)
+        if len(src_face) == 0:
+            print(f"No face detected in the frame")
+            raise Exception(f"No face detected in the frame")
+        elif len(src_face) > 1:
+            print(f"More than one face detected in the driving frame, only pick one face.")
+        src_face = src_face[0]
+        lmk = src_face["landmark_2d_106"]
+        lmk = landmark_runner(models, img, lmk)
+    else:
+        lmk = landmark_runner(models, img, pred_info['lmk'])
+    pred_info['lmk'] = lmk
+
+    # calc_driving_ratio
+    lmk = lmk[None]
+    c_d_eyes = np.concatenate(
+        [
+            calculate_distance_ratio(lmk, 6, 18, 0, 12),
+            calculate_distance_ratio(lmk, 30, 42, 24, 36),
+        ],
+        axis=1,
+    )
+    c_d_lip = calculate_distance_ratio(lmk, 90, 102, 48, 66)
+    c_d_eyes = c_d_eyes.astype(np.float32)
+    c_d_lip = c_d_lip.astype(np.float32)
+
+    # prepare_driving_videos
+    img = cv2.resize(img, (256, 256))
+    I_d = preprocess(img)
+
+    # collect s_d, R_d, δ_d and t_d for inference
+    x_d_info = get_kp_info(models, I_d)
+    R_d = get_rotation_matrix(x_d_info["pitch"], x_d_info["yaw"], x_d_info["roll"])
+    x_d_info = {
+        "scale": x_d_info["scale"].astype(np.float32),
+        "R_d": R_d.astype(np.float32),
+        "exp": x_d_info["exp"].astype(np.float32),
+        "t": x_d_info["t"].astype(np.float32),
+    }
+
+    if frame_0:
+        pred_info['x_d_0_info'] = x_d_info
+
+    x_d_0_info = pred_info['x_d_0_info']
+    R_d_0 = x_d_0_info["R_d"]
+
+    R_new = (R_d @ R_d_0.transpose(0, 2, 1)) @ R_s
+    delta_new = x_s_info["exp"] + (x_d_info["exp"] - x_d_0_info["exp"])
+    scale_new = x_s_info["scale"] * (x_d_info["scale"] / x_d_0_info["scale"])
+    t_new = x_s_info["t"] + (x_d_info["t"] - x_d_0_info["t"])
+
+    t_new[..., 2] = 0  # zero tz
+    x_c_s = x_s_info["kp"]
+    x_d_new = scale_new * (x_c_s @ R_new + delta_new) + t_new
+
+    # with stitching and without retargeting
+    x_d_new = stitching(models, x_s, x_d_new)
+
+    out = warping_spade(models, f_s, x_s, x_d_new)
+    # out = out["out"]
+    out = out.transpose(0, 2, 3, 1)  # 1x3xHxW -> 1xHxWx3
+    out = np.clip(out, 0, 1)  # clip to 0~1
+    out = (out * 255).astype(np.uint8)  # 0~1 -> 0~255
+    I_p = out[0]
+
+    return I_p, pred_info
+
+class LivePortraitWrapper():
+    def __init__(self):
+        so = onnxruntime.SessionOptions()
+        so.log_severity_level = 3
+        appearance_feature_extractor = onnxruntime.InferenceSession("weights/appearance_feature_extractor.onnx", so)
+        motion_extractor = onnxruntime.InferenceSession("weights/motion_extractor.onnx", so)
+        warping_spade = onnxruntime.InferenceSession("weights/warping_spade.onnx", so)
+        stitching_module = onnxruntime.InferenceSession("weights/stitching.onnx", so)
+        landmark_run = onnxruntime.InferenceSession("weights/landmark.onnx", so)
+        det_face = onnxruntime.InferenceSession("weights/det_10g.onnx", so)
+        landmark = onnxruntime.InferenceSession("weights/2d106det.onnx", so)
+
+        face_analysis = get_face_analysis(det_face, landmark)
+
+        self.models = {
+            "appearance_feature_extractor": appearance_feature_extractor,
+            "motion_extractor": motion_extractor,
+            "warping_spade": warping_spade,
+            "stitching": stitching_module,
+            "landmark_runner": landmark_run,
+            "face_analysis": face_analysis,
+        }
+        self.maskpath = 'mask_template.png'
+        mask_crop = cv2.imread(self.maskpath)
+        self.mask_crop = cv2.cvtColor(mask_crop, cv2.COLOR_BGRA2BGR)
+        self.flg_composite = False
+        self.pred_info = {'lmk':None, 'x_d_0_info':None}
+
+    def execute(self, imgpath, videopath):
+        img = cv2.imread(imgpath)
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        img = img[:, :, ::-1]  # BGR -> RGB
+        src_img = src_preprocess(img)
+        crop_info = crop_src_image(self.models, src_img)
+
+        # prepare_source
+        img_crop_256x256 = crop_info["img_crop_256x256"]
+        I_s = preprocess(img_crop_256x256)
+
+        x_s_info = get_kp_info(self.models, I_s)
+        R_s = get_rotation_matrix(x_s_info["pitch"], x_s_info["yaw"], x_s_info["roll"])
+        f_s = extract_feature_3d(self.models, I_s)
+        x_s = transform_keypoint(x_s_info)
+
+        capture = cv2.VideoCapture(videopath)
+        fps = int(capture.get(cv2.CAP_PROP_FPS))
+        f_h, f_w = (512, 512 * 3) if self.flg_composite else src_img.shape[:2]
+
+        # prepare for pasteback
+        mask_ori = prepare_paste_back(self.mask_crop, crop_info["M_c2o"], dsize=(src_img.shape[1], src_img.shape[0]))
+
+        video_writer = cv2.VideoWriter('output.mp4', cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), fps, (f_w, f_h))
+        frame_id = 0
+        while True:
+            ret, frame = capture.read()
+            if (cv2.waitKey(1) & 0xFF == ord("q")) or not ret:
+                break
+
+            # inference
+            img_rgb = frame[:, :, ::-1]  # BGR -> RGB
+            a = time.time()
+            I_p, self.pred_info = predict(frame_id, self.models, x_s_info, R_s, f_s, x_s, img_rgb, self.pred_info)
+            b = time.time()
+            print(f"frame_id={frame_id}, predict waste time {b-a} s")
+            frame_id += 1
+
+            if self.flg_composite:
+                driving_img = concat_frame(img_rgb, img_crop_256x256, I_p)
+            else:
+                driving_img = paste_back(I_p, crop_info["M_c2o"], src_img, mask_ori)
+            driving_img = driving_img[:, :, ::-1]  # RGB -> BGR
+
+            # cv2.imshow('frame', driving_img)
+            # key = cv2.waitKey(1)
+            # if key == 27:  # ESC
+            #     break
+
+            video_writer.write(driving_img)
+
+        capture.release()
+        video_writer.release()
+        cv2.destroyAllWindows()
+
+if __name__=='__main__':
+    live_portrait_pipeline = LivePortraitWrapper()
+
+    imgpath = '0.jpg'
+    videopath = 'd0.mp4'
+    live_portrait_pipeline.execute(imgpath, videopath)
