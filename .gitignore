@@ -28,6 +28,7 @@ gradio_temp/**
 # Windows dependencies
 ffmpeg/
 LivePortrait_env/
+onnx_models/
 
 # XPose build files
 src/utils/dependencies/XPose/models/UniPose/ops/build
