@@ -202,15 +202,11 @@ class ONNXLivePortraitPipeline:
         if img.ndim == 3:
             img = img[None, ...]  # Add batch dimension
 
-        if img.shape[-1] == 3:  # RGB to BGR
-            img = img[..., ::-1]
-
-        # Normalize and transpose
+        # NO BGR/RGB conversion - keep the input format (RGB from load_image_rgb)
+        # Normalize and transpose to match PyTorch version exactly
         img = img.astype(np.float32) / 255.0
-        if img.ndim == 4:
-            img = np.transpose(img, (0, 3, 1, 2))  # BHWC -> BCHW
-        else:
-            img = np.transpose(img, (2, 0, 1))[None, ...]  # HWC -> BCHW
+        img = np.clip(img, 0, 1)  # clip to 0~1
+        img = np.transpose(img, (0, 3, 1, 2))  # BHWC -> BCHW
 
         return img
 
