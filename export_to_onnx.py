@@ -638,23 +638,40 @@ def main():
         # Load and export Stitching/Retargeting Networks (S)
         if os.path.exists(inference_cfg.checkpoint_S):
             print("\n5. Loading Stitching/Retargeting Networks...")
+
             stitching_model = load_model(inference_cfg.checkpoint_S, model_config, device, 'stitching_retargeting_module')
 
             # Extract individual networks
             stitching_dict = {}
-            if hasattr(stitching_model, 'stitching'):
-                stitching_dict['stitching'] = stitching_model.stitching
-            if hasattr(stitching_model, 'lip'):
-                stitching_dict['lip'] = stitching_model.lip
-            if hasattr(stitching_model, 'eye'):
-                stitching_dict['eye'] = stitching_model.eye
 
-            export_stitching_retargeting_to_onnx(
-                stitching_dict,
-                str(output_dir / "stitching"),
-                device,
-                opset_version
-            )
+            # Handle case where model is a dict (which it is!)
+            if isinstance(stitching_model, dict):
+                for component_name in ['stitching', 'lip', 'eye']:
+                    if component_name in stitching_model:
+                        component = stitching_model[component_name]
+                        stitching_dict[component_name] = component
+            else:
+                # Handle case where model has attributes
+                for component_name in ['stitching', 'lip', 'eye']:
+                    if hasattr(stitching_model, component_name):
+                        component = getattr(stitching_model, component_name)
+                        stitching_dict[component_name] = component
+
+                # Check if it's a ModuleDict
+                if hasattr(stitching_model, '_modules'):
+                    for module_name, module in stitching_model._modules.items():
+                        if module_name in ['stitching', 'lip', 'eye']:
+                            stitching_dict[module_name] = module
+
+            if stitching_dict:
+                export_stitching_retargeting_to_onnx(
+                    stitching_dict,
+                    str(output_dir / "stitching"),
+                    device,
+                    opset_version
+                )
+            else:
+                print("Warning: No stitching components found - skipping export")
 
         # Export Animal Models (if requested)
         if not args.human_only:
