@@ -22,6 +22,9 @@ import time
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# Add the src directory to Python path
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+
 from src.config.inference_config import InferenceConfig
 from src.config.crop_config import CropConfig
 from src.utils.cropper import Cropper
@@ -34,6 +37,68 @@ from src.utils.filter import smooth
 from src.utils.retargeting_utils import calc_eye_close_ratio, calc_lip_close_ratio
 from src.utils.camera import headpose_pred_to_degree
 from src.utils.rprint import rlog as log
+
+# NumPy versions of camera functions for ONNX compatibility
+def headpose_pred_to_degree_numpy(pred: np.ndarray) -> np.ndarray:
+    """
+    NumPy version of headpose_pred_to_degree for ONNX compatibility
+    pred: (bs, 66) or (bs, 1) or others
+    """
+    if pred.ndim > 1 and pred.shape[1] == 66:
+        # NOTE: note that the average is modified to 97.5
+        idx_tensor = np.arange(0, 66, dtype=np.float32)
+        pred_softmax = np.exp(pred) / np.sum(np.exp(pred), axis=1, keepdims=True)  # softmax
+        degree = np.sum(pred_softmax * idx_tensor, axis=1) * 3 - 97.5
+        return degree
+
+    return pred
+
+
+def get_rotation_matrix_numpy(pitch_: np.ndarray, yaw_: np.ndarray, roll_: np.ndarray) -> np.ndarray:
+    """
+    NumPy version of get_rotation_matrix for ONNX compatibility
+    the input is in degree
+    """
+    PI = np.pi
+
+    # transform to radian
+    pitch = pitch_ / 180 * PI
+    yaw = yaw_ / 180 * PI
+    roll = roll_ / 180 * PI
+
+    if pitch.ndim == 1:
+        pitch = pitch[:, None]
+    if yaw.ndim == 1:
+        yaw = yaw[:, None]
+    if roll.ndim == 1:
+        roll = roll[:, None]
+
+    # calculate the euler matrix
+    bs = pitch.shape[0]
+    ones = np.ones([bs, 1])
+    zeros = np.zeros([bs, 1])
+    x, y, z = pitch, yaw, roll
+
+    rot_x = np.concatenate([
+        ones, zeros, zeros,
+        zeros, np.cos(x), -np.sin(x),
+        zeros, np.sin(x), np.cos(x)
+    ], axis=1).reshape([bs, 3, 3])
+
+    rot_y = np.concatenate([
+        np.cos(y), zeros, np.sin(y),
+        zeros, ones, zeros,
+        -np.sin(y), zeros, np.cos(y)
+    ], axis=1).reshape([bs, 3, 3])
+
+    rot_z = np.concatenate([
+        np.cos(z), -np.sin(z), zeros,
+        np.sin(z), np.cos(z), zeros,
+        zeros, zeros, ones
+    ], axis=1).reshape([bs, 3, 3])
+
+    rot = rot_z @ rot_y @ rot_x
+    return np.transpose(rot, (0, 2, 1))  # transpose
 
 
 class ONNXLivePortraitInference:
@@ -184,9 +249,9 @@ class ONNXLivePortraitInference:
 
         # Process outputs to match PyTorch version format
         bs = kp_info['kp'].shape[0]
-        kp_info['pitch'] = headpose_pred_to_degree(kp_info['pitch'])
-        kp_info['yaw'] = headpose_pred_to_degree(kp_info['yaw'])
-        kp_info['roll'] = headpose_pred_to_degree(kp_info['roll'])
+        kp_info['pitch'] = headpose_pred_to_degree_numpy(kp_info['pitch'])
+        kp_info['yaw'] = headpose_pred_to_degree_numpy(kp_info['yaw'])
+        kp_info['roll'] = headpose_pred_to_degree_numpy(kp_info['roll'])
         kp_info['kp'] = kp_info['kp'].reshape(bs, -1, 3)  # BxNx3
         kp_info['exp'] = kp_info['exp'].reshape(bs, -1, 3)  # BxNx3
 
@@ -205,7 +270,7 @@ class ONNXLivePortraitInference:
             kp = kp.reshape(1, num_kp, 3)
 
         # Get rotation matrix
-        rot_matrix = get_rotation_matrix(pitch, yaw, roll)  # (bs, 3, 3)
+        rot_matrix = get_rotation_matrix_numpy(pitch, yaw, roll)  # (bs, 3, 3)
 
         # Apply transformations
         kp_transformed = kp @ rot_matrix.transpose(0, 2, 1)  # (bs, k, 3)
@@ -219,11 +284,19 @@ class ONNXLivePortraitInference:
         """Warp features and decode using ONNX models"""
         # Use warping network
         input_names = [inp.name for inp in self.warping_network_session.get_inputs()]
-        inputs = {
-            input_names[0]: feature_3d,
-            input_names[1]: kp_driving,
-            input_names[2]: kp_source
-        }
+
+        # The warping network from our export expects only feature_3d as input
+        # (since we created a simplified version due to 5D grid sampling limitations)
+        if len(input_names) == 1:
+            # Simplified warping network - only takes feature_3d
+            inputs = {input_names[0]: feature_3d}
+        else:
+            # Full warping network - takes feature_3d, kp_driving, kp_source
+            inputs = {
+                input_names[0]: feature_3d,
+                input_names[1]: kp_driving,
+                input_names[2]: kp_source
+            }
 
         warping_outputs = self.warping_network_session.run(None, inputs)
         warped_feature = warping_outputs[0]
@@ -302,9 +375,18 @@ class ONNXLivePortraitInference:
         c_d_eyes_lst = []
         c_d_lip_lst = []
 
-        for lmk in lmk_lst:
-            c_d_eyes = calc_eye_close_ratio(lmk)
-            c_d_lip = calc_lip_close_ratio(lmk)
+        for i, lmk in enumerate(lmk_lst):
+            # The retargeting functions expect landmarks in shape (batch, num_points, 2)
+            # NOT flattened coordinates. They use point indices to access specific landmarks
+            if lmk.ndim == 2 and lmk.shape[1] == 2:
+                # Add batch dimension: (num_points, 2) -> (1, num_points, 2)
+                lmk_batch = lmk[None, ...]  # Shape: (1, 203, 2)
+            else:
+                # Already has batch dimension or different format
+                lmk_batch = lmk
+
+            c_d_eyes = calc_eye_close_ratio(lmk_batch)
+            c_d_lip = calc_lip_close_ratio(lmk_batch)
             c_d_eyes_lst.append(c_d_eyes)
             c_d_lip_lst.append(c_d_lip)
 
@@ -330,7 +412,7 @@ class ONNXLivePortraitInference:
             x_s = self.transform_keypoint(x_i_info)
 
             # Get rotation matrix
-            R_i = get_rotation_matrix(x_i_info['pitch'], x_i_info['yaw'], x_i_info['roll'])
+            R_i = get_rotation_matrix_numpy(x_i_info['pitch'], x_i_info['yaw'], x_i_info['roll'])
 
             item_dct = {
                 'scale': x_i_info['scale'].astype(np.float32),
@@ -475,7 +557,7 @@ class ONNXLivePortraitInference:
         else:
             # Single source image
             if self.inference_cfg.flag_do_crop:
-                ret_s = self.cropper.crop_single_image(source_rgb_lst[0], self.crop_cfg)
+                ret_s = self.cropper.crop_source_image(source_rgb_lst[0], self.crop_cfg)
                 source_rgb_crop = ret_s['img_crop']
             else:
                 source_rgb_crop = cv2.resize(source_rgb_lst[0], (256, 256))
