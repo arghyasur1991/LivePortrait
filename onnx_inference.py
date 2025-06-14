@@ -9,6 +9,8 @@ Usage:
 """
 
 import os
+import os.path as osp
+import sys
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -17,14 +19,16 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import time
+import tyro
+import subprocess
 
 # Add the project root to Python path
-import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Add the src directory to Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
+from src.config.argument_config import ArgumentConfig
 from src.config.inference_config import InferenceConfig
 from src.config.crop_config import CropConfig
 from src.utils.cropper import Cropper
@@ -101,151 +105,129 @@ def get_rotation_matrix_numpy(pitch_: np.ndarray, yaw_: np.ndarray, roll_: np.nd
     return np.transpose(rot, (0, 2, 1))  # transpose
 
 
-class ONNXLivePortraitInference:
-    def __init__(self,
-                 model_dir: str = "./onnx_models",
-                 device: str = "cpu",
-                 use_int8: bool = False,
-                 providers: Optional[List] = None):
-        """
-        Initialize ONNX LivePortrait inference
+def partial_fields(target_class, kwargs):
+    return target_class(**{k: v for k, v in kwargs.items() if hasattr(target_class, k)})
 
-        Args:
-            model_dir: Directory containing ONNX models
-            device: Device to run inference on ('cpu', 'cuda')
-            use_int8: Whether to use INT8 quantized models
-            providers: ONNX Runtime providers to use
-        """
-        self.model_dir = Path(model_dir)
-        self.device = device
-        self.use_int8 = use_int8
 
-        # Set up ONNX Runtime providers
-        if providers is None:
-            if device == 'cuda':
-                self.providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            else:
-                self.providers = ['CPUExecutionProvider']
-        else:
-            self.providers = providers
+def fast_check_ffmpeg():
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        return True
+    except:
+        return False
 
-        # Set session options for optimization
-        self.session_options = ort.SessionOptions()
-        self.session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        if use_int8:
-            print("Enabling INT8 optimizations in ONNX Runtime...")
-            self.session_options.add_session_config_entry('session.intra_op_num_threads', '0')
-            self.session_options.add_session_config_entry('session.inter_op_num_threads', '0')
+def fast_check_args(args: ArgumentConfig):
+    if not osp.exists(args.source):
+        raise FileNotFoundError(f"source info not found: {args.source}")
+    if not osp.exists(args.driving):
+        raise FileNotFoundError(f"driving info not found: {args.driving}")
 
-        print(f"Using ONNX providers: {self.providers}")
 
-        # Initialize configurations (needed for cropping and other utilities)
-        self.inference_cfg = InferenceConfig()
-        self.crop_cfg = CropConfig()
-        self.cropper = Cropper(crop_cfg=self.crop_cfg)
+class ONNXLivePortraitPipeline:
+    """ONNX-based LivePortrait pipeline that mimics LivePortraitPipeline"""
 
-        # Load all ONNX models
-        self.load_onnx_models()
+    def __init__(self, inference_cfg: InferenceConfig, crop_cfg: CropConfig, model_dir: str = "./onnx_models"):
+        self.inference_cfg = inference_cfg
+        self.crop_cfg = crop_cfg
+        self.model_dir = model_dir
 
-        print("✓ ONNX LivePortrait inference initialized successfully")
+        # Initialize ONNX runtime
+        providers = ['CPUExecutionProvider']
+        if inference_cfg.device_id >= 0 and not inference_cfg.flag_force_cpu:
+            try:
+                providers = [('CUDAExecutionProvider', {'device_id': inference_cfg.device_id}), 'CPUExecutionProvider']
+            except:
+                pass
+
+        log(f"Using ONNX providers: {[p if isinstance(p, str) else p[0] for p in providers]}")
+
+        # Load ONNX models
+        self.load_onnx_models(providers)
+
+        # Initialize cropper
+        self.cropper = Cropper(
+            crop_cfg=crop_cfg,
+            flag_force_cpu=inference_cfg.flag_force_cpu,
+            device_id=inference_cfg.device_id
+        )
+
+        log("✓ ONNX LivePortrait pipeline initialized successfully")
 
     def get_model_path(self, model_name: str, model_type: str = "human") -> str:
         """Get path to ONNX model"""
-        suffix = "_int8.onnx" if self.use_int8 else ".onnx"
-
         if model_type == "animal":
-            return str(self.model_dir / "animal" / f"{model_name}{suffix}")
-        else:
-            return str(self.model_dir / f"{model_name}{suffix}")
+            return osp.join(self.model_dir, "animal", f"{model_name}.onnx")
+        return osp.join(self.model_dir, f"{model_name}.onnx")
 
-    def load_onnx_models(self):
+    def load_onnx_models(self, providers):
         """Load all ONNX models"""
-        print("Loading ONNX models...")
+        log("Loading ONNX models...")
 
-        try:
-            # Load Appearance Feature Extractor (F)
-            f_path = self.get_model_path("appearance_feature_extractor")
-            print(f"Loading Appearance Feature Extractor from {f_path}")
-            self.appearance_extractor_session = ort.InferenceSession(
-                f_path, self.session_options, providers=self.providers
-            )
+        # Load main models
+        appearance_model_path = self.get_model_path("appearance_feature_extractor")
+        motion_model_path = self.get_model_path("motion_extractor")
+        warping_model_path = self.get_model_path("warping_network")
+        generator_model_path = self.get_model_path("spade_generator")
 
-            # Load Motion Extractor (M)
-            m_path = self.get_model_path("motion_extractor")
-            print(f"Loading Motion Extractor from {m_path}")
-            self.motion_extractor_session = ort.InferenceSession(
-                m_path, self.session_options, providers=self.providers
-            )
+        log(f"Loading Appearance Feature Extractor from {appearance_model_path}")
+        self.appearance_feature_extractor_session = ort.InferenceSession(appearance_model_path, providers=providers)
 
-            # Load Warping Network (W)
-            w_path = self.get_model_path("warping_network")
-            print(f"Loading Warping Network from {w_path}")
-            self.warping_network_session = ort.InferenceSession(
-                w_path, self.session_options, providers=self.providers
-            )
+        log(f"Loading Motion Extractor from {motion_model_path}")
+        self.motion_extractor_session = ort.InferenceSession(motion_model_path, providers=providers)
 
-            # Load SPADE Generator (G)
-            g_path = self.get_model_path("spade_generator")
-            print(f"Loading SPADE Generator from {g_path}")
-            self.spade_generator_session = ort.InferenceSession(
-                g_path, self.session_options, providers=self.providers
-            )
+        log(f"Loading Warping Network from {warping_model_path}")
+        self.warping_network_session = ort.InferenceSession(warping_model_path, providers=providers)
 
-            # Load Stitching/Retargeting Networks (S) - optional
-            self.stitching_sessions = {}
-            stitching_dir = self.model_dir / "stitching"
-            if stitching_dir.exists():
-                for network_name in ['stitching', 'lip', 'eye']:
-                    network_path = stitching_dir / f"{network_name}.onnx"
-                    if network_path.exists():
-                        print(f"Loading {network_name} network from {network_path}")
-                        self.stitching_sessions[network_name] = ort.InferenceSession(
-                            str(network_path), self.session_options, providers=self.providers
-                        )
+        log(f"Loading SPADE Generator from {generator_model_path}")
+        self.spade_generator_session = ort.InferenceSession(generator_model_path, providers=providers)
 
-            print("✓ All ONNX models loaded successfully")
+        # Load stitching models if available
+        self.stitching_sessions = {}
+        stitching_dir = osp.join(self.model_dir, "stitching")
+        if osp.exists(stitching_dir):
+            for model_name in ["stitching", "eye", "lip"]:
+                model_path = osp.join(stitching_dir, f"{model_name}.onnx")
+                if osp.exists(model_path):
+                    self.stitching_sessions[model_name] = ort.InferenceSession(model_path, providers=providers)
 
-        except Exception as e:
-            print(f"❌ Failed to load ONNX models: {e}")
-            raise
+        log("✓ All ONNX models loaded successfully")
 
     def prepare_source(self, img: np.ndarray) -> np.ndarray:
         """Prepare source image for inference"""
-        h, w = img.shape[:2]
-        if h != 256 or w != 256:
-            x = cv2.resize(img, (256, 256))
-        else:
-            x = img.copy()
+        # Resize to 256x256 for ONNX models
+        if img.shape[:2] != (256, 256):
+            img = cv2.resize(img, (256, 256))
 
-        if x.ndim == 3:
-            x = x[np.newaxis].astype(np.float32) / 255.0  # HxWx3 -> 1xHxWx3, normalized to 0~1
-        elif x.ndim == 4:
-            x = x.astype(np.float32) / 255.0  # BxHxWx3, normalized to 0~1
-        else:
-            raise ValueError(f'img ndim should be 3 or 4: {x.ndim}')
+        if img.ndim == 3:
+            img = img[None, ...]  # Add batch dimension
 
-        x = np.clip(x, 0, 1)  # clip to 0~1
-        x = x.transpose(0, 3, 1, 2)  # 1xHxWx3 -> 1x3xHxW
-        return x
+        if img.shape[-1] == 3:  # RGB to BGR
+            img = img[..., ::-1]
+
+        # Normalize and transpose
+        img = img.astype(np.float32) / 255.0
+        if img.ndim == 4:
+            img = np.transpose(img, (0, 3, 1, 2))  # BHWC -> BCHW
+        else:
+            img = np.transpose(img, (2, 0, 1))[None, ...]  # HWC -> BCHW
+
+        return img
 
     def extract_feature_3d(self, x: np.ndarray) -> np.ndarray:
-        """Extract 3D appearance features using ONNX model"""
-        input_name = self.appearance_extractor_session.get_inputs()[0].name
-        output = self.appearance_extractor_session.run(None, {input_name: x})
+        """Extract 3D features using ONNX model"""
+        input_name = self.appearance_feature_extractor_session.get_inputs()[0].name
+        output = self.appearance_feature_extractor_session.run(None, {input_name: x})
         return output[0]
 
     def get_kp_info(self, x: np.ndarray) -> Dict[str, np.ndarray]:
-        """Get keypoint information using ONNX model"""
+        """Get keypoint info using ONNX model"""
         input_name = self.motion_extractor_session.get_inputs()[0].name
         outputs = self.motion_extractor_session.run(None, {input_name: x})
 
-        # Outputs are: ['pitch', 'yaw', 'roll', 't', 'exp', 'scale', 'kp']
+        # Map outputs to keys
         output_names = [out.name for out in self.motion_extractor_session.get_outputs()]
-
-        kp_info = {}
-        for i, name in enumerate(output_names):
-            kp_info[name] = outputs[i]
+        kp_info = dict(zip(output_names, outputs))
 
         # Process outputs to match PyTorch version format
         bs = kp_info['kp'].shape[0]
@@ -258,25 +240,25 @@ class ONNXLivePortraitInference:
         return kp_info
 
     def transform_keypoint(self, kp_info: Dict[str, np.ndarray]) -> np.ndarray:
-        """Transform keypoints with pose, shift, and expression deformation"""
-        kp = kp_info['kp']    # (bs, k, 3)
+        """Transform keypoints using pose and expression"""
+        kp = kp_info['kp']  # (bs, k, 3)
         pitch, yaw, roll = kp_info['pitch'], kp_info['yaw'], kp_info['roll']
         t, exp = kp_info['t'], kp_info['exp']
         scale = kp_info['scale']
 
         bs = kp.shape[0]
         if kp.ndim == 2:
-            num_kp = kp.shape[0] // 3
-            kp = kp.reshape(1, num_kp, 3)
+            num_kp = kp.shape[1] // 3  # Bx(num_kpx3)
+        else:
+            num_kp = kp.shape[1]  # Bxnum_kpx3
 
         # Get rotation matrix
         rot_matrix = get_rotation_matrix_numpy(pitch, yaw, roll)  # (bs, 3, 3)
 
         # Apply transformations
-        kp_transformed = kp @ rot_matrix.transpose(0, 2, 1)  # (bs, k, 3)
-        kp_transformed += exp
-        kp_transformed = kp_transformed * scale[..., None, None]
-        kp_transformed[..., :2] += t[..., None, :2]
+        kp_transformed = kp.reshape(bs, num_kp, 3) @ rot_matrix + exp.reshape(bs, num_kp, 3)
+        kp_transformed *= scale[..., None]  # (bs, k, 3) * (bs, 1, 1) = (bs, k, 3)
+        kp_transformed[:, :, 0:2] += t[:, None, 0:2]  # remove z, only apply tx ty
 
         return kp_transformed.reshape(bs, -1)
 
@@ -404,7 +386,8 @@ class ONNXLivePortraitInference:
         }
 
         for i in range(n_frames):
-            print(f"Processing frame {i+1}/{n_frames}")
+            if i % 10 == 0 or i == n_frames - 1:
+                log(f"Processing frame {i+1}/{n_frames}")
 
             # Get keypoint info using ONNX model
             I_i = I_lst[i:i+1]  # Keep batch dimension
@@ -429,8 +412,8 @@ class ONNXLivePortraitInference:
 
         return template_dct
 
-    def execute(self, args):
-        """Main execution function"""
+    def execute(self, args: ArgumentConfig):
+        """Main execution function - matches LivePortraitPipeline.execute()"""
         log("Starting ONNX LivePortrait inference...")
 
         ######## Load source input ########
@@ -475,7 +458,7 @@ class ONNXLivePortraitInference:
             output_fps = driving_template_dct.get('output_fps', self.inference_cfg.output_fps)
             log(f'The FPS of template: {output_fps}')
 
-        elif os.path.exists(args.driving):
+        elif osp.exists(args.driving):
             if is_video(args.driving):
                 flag_is_driving_video = True
                 output_fps = int(get_fps(args.driving))
@@ -570,7 +553,7 @@ class ONNXLivePortraitInference:
         # Generate animated frames
         log("Generating animated frames...")
         for i in range(n_frames):
-            if i % 10 == 0:
+            if i % 10 == 0 or i == n_frames - 1:
                 log(f"Processing frame {i+1}/{n_frames}")
 
             # Get driving motion
@@ -579,84 +562,90 @@ class ONNXLivePortraitInference:
 
             # Apply retargeting if enabled
             if self.inference_cfg.flag_eye_retargeting:
-                driving_kp = self.retarget_eye(driving_kp, c_d_eyes_lst[i])
+                driving_kp = self.retarget_eye(driving_kp, c_d_eyes_lst[i][0][0])
+
             if self.inference_cfg.flag_lip_retargeting:
-                driving_kp = self.retarget_lip(driving_kp, c_d_lip_lst[i])
+                driving_kp = self.retarget_lip(driving_kp, c_d_lip_lst[i][0])
+
+            # Apply stitching if enabled
             if self.inference_cfg.flag_stitching:
                 driving_kp = self.stitching(source_kp, driving_kp)
 
             # Generate frame
             out = self.warp_decode(source_feature_3d, source_kp.reshape(1, -1), driving_kp.reshape(1, -1))
-            out_img = self.parse_output(out)
-            I_p_lst.append(out_img)
+            I_p = self.parse_output(out)
+            I_p_lst.append(I_p)
 
-        # Save results
-        wfp_out = f"{remove_suffix(args.source)}_onnx_{basename(args.driving)}.mp4"
-        log(f"Saving result to {wfp_out}")
+        ######## Paste back and save result ########
+        # Create output filename with "_onnx" suffix
+        source_name = osp.splitext(osp.basename(args.source))[0]
+        driving_name = osp.splitext(osp.basename(args.driving))[0]
+        output_name = f"{source_name}_onnx_{driving_name}.mp4"
+        wfp_concat = osp.join(args.output_dir, output_name)
 
-        images2video(I_p_lst, wfp=wfp_out, fps=output_fps)
+        # Ensure output directory exists
+        os.makedirs(args.output_dir, exist_ok=True)
 
-        # Add audio if available
-        if has_audio_stream(args.driving):
-            log("Adding audio to output video...")
-            wfp_out_with_audio = wfp_out.replace('.mp4', '_with_audio.mp4')
-            add_audio_to_video(wfp_out, args.driving, wfp_out_with_audio)
-            log(f"Final result with audio: {wfp_out_with_audio}")
+        if args.flag_pasteback and args.flag_do_crop:
+            # Paste back processing
+            log("Pasting back...")
+            I_p_pstbk_lst = []
 
+            if flag_is_source_video:
+                for i, I_p_i in enumerate(I_p_lst):
+                    source_rgb_i = source_rgb_lst[i]
+                    crop_M_c2o = ret_s['M_c2o_lst'][i]
+                    mask_ori = prepare_paste_back(self.inference_cfg.mask_crop, crop_M_c2o,
+                                                dsize=(source_rgb_i.shape[1], source_rgb_i.shape[0]))
+                    I_p_pstbk = paste_back(I_p_i, crop_M_c2o, source_rgb_i, mask_ori)
+                    I_p_pstbk_lst.append(I_p_pstbk)
+            else:
+                # Single source image
+                crop_M_c2o = ret_s['M_c2o']
+                source_rgb = source_rgb_lst[0]
+                mask_ori = prepare_paste_back(self.inference_cfg.mask_crop, crop_M_c2o,
+                                            dsize=(source_rgb.shape[1], source_rgb.shape[0]))
+                for I_p_i in I_p_lst:
+                    I_p_pstbk = paste_back(I_p_i, crop_M_c2o, source_rgb, mask_ori)
+                    I_p_pstbk_lst.append(I_p_pstbk)
+
+            wfp_concat = images2video(I_p_pstbk_lst, wfp_concat, fps=output_fps)
+        else:
+            wfp_concat = images2video(I_p_lst, wfp_concat, fps=output_fps)
+
+        log(f"Saving result to {wfp_concat}")
         log("✅ ONNX inference completed!")
+        return wfp_concat
 
 
 def main():
-    parser = argparse.ArgumentParser(description='ONNX LivePortrait Inference')
-    parser.add_argument('--source', type=str, required=True,
-                       help='Source image or video path')
-    parser.add_argument('--driving', type=str, required=True,
-                       help='Driving video or image path')
-    parser.add_argument('--model_dir', type=str, default='./onnx_models',
-                       help='Directory containing ONNX models')
-    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'],
-                       help='Device for inference')
-    parser.add_argument('--use_int8', action='store_true',
-                       help='Use INT8 quantized models')
-    parser.add_argument('--flag_eye_retargeting', action='store_true',
-                       help='Enable eye retargeting')
-    parser.add_argument('--flag_lip_retargeting', action='store_true',
-                       help='Enable lip retargeting')
-    parser.add_argument('--flag_stitching', action='store_true', default=True,
-                       help='Enable stitching')
+    # set tyro theme
+    tyro.extras.set_accent_color("bright_cyan")
+    args = tyro.cli(ArgumentConfig)
 
-    args = parser.parse_args()
+    ffmpeg_dir = os.path.join(os.getcwd(), "ffmpeg")
+    if osp.exists(ffmpeg_dir):
+        os.environ["PATH"] += (os.pathsep + ffmpeg_dir)
 
-    # Check if model directory exists
-    if not os.path.exists(args.model_dir):
-        print(f"❌ Model directory {args.model_dir} does not exist!")
-        print("Please run export_to_onnx.py first to generate ONNX models.")
-        return
-
-    try:
-        # Initialize ONNX inference
-        onnx_inference = ONNXLivePortraitInference(
-            model_dir=args.model_dir,
-            device=args.device,
-            use_int8=args.use_int8
+    if not fast_check_ffmpeg():
+        raise ImportError(
+            "FFmpeg is not installed. Please install FFmpeg (including ffmpeg and ffprobe) before running this script. https://ffmpeg.org/download.html"
         )
 
-        # Set inference flags
-        onnx_inference.inference_cfg.flag_eye_retargeting = args.flag_eye_retargeting
-        onnx_inference.inference_cfg.flag_lip_retargeting = args.flag_lip_retargeting
-        onnx_inference.inference_cfg.flag_stitching = args.flag_stitching
+    fast_check_args(args)
 
-        # Run inference
-        start_time = time.time()
-        onnx_inference.execute(args)
-        end_time = time.time()
+    # specify configs for inference
+    inference_cfg = partial_fields(InferenceConfig, args.__dict__)
+    crop_cfg = partial_fields(CropConfig, args.__dict__)
 
-        print(f"Total inference time: {end_time - start_time:.2f} seconds")
+    onnx_pipeline = ONNXLivePortraitPipeline(
+        inference_cfg=inference_cfg,
+        crop_cfg=crop_cfg,
+        model_dir="./onnx_models"
+    )
 
-    except Exception as e:
-        print(f"❌ ONNX inference failed: {e}")
-        import traceback
-        traceback.print_exc()
+    # run
+    onnx_pipeline.execute(args)
 
 
 if __name__ == "__main__":
