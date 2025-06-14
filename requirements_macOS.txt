@@ -1,7 +1,19 @@
 -r requirements_base.txt
 
+# PyTorch and related packages - updated for opset 20 ONNX support
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.3.0
-torchvision==0.18.0
-torchaudio==2.3.0
-onnxruntime-silicon==1.16.3
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+
+# ONNX packages - updated for opset 20 support
+onnx==1.18.0
+onnxruntime==1.22.0
+
+# Note: We switched from onnxruntime-silicon to general onnxruntime
+# for better opset 20 compatibility. If you prefer silicon-optimized runtime
+# and don't need opset 20, you can use:
+# onnxruntime-silicon==1.16.3
+
+# NumPy - updated automatically with PyTorch
+numpy==2.2.6
