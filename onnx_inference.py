@@ -260,24 +260,22 @@ class ONNXLivePortraitPipeline:
 
     def warp_decode(self, feature_3d: np.ndarray, kp_source: np.ndarray, kp_driving: np.ndarray) -> np.ndarray:
         """Warp features and decode using ONNX models"""
-        # Use warping network
-        input_names = [inp.name for inp in self.warping_network_session.get_inputs()]
+        # Ensure keypoints are in correct 3D shape (batch, 21, 3)
+        if kp_driving.ndim == 2:
+            kp_driving = kp_driving.reshape(kp_driving.shape[0], -1, 3)
+        if kp_source.ndim == 2:
+            kp_source = kp_source.reshape(kp_source.shape[0], -1, 3)
 
-        # The warping network from our export expects only feature_3d as input
-        # (since we created a simplified version due to 5D grid sampling limitations)
-        if len(input_names) == 1:
-            # Simplified warping network - only takes feature_3d
-            inputs = {input_names[0]: feature_3d}
-        else:
-            # Full warping network - takes feature_3d, kp_driving, kp_source
-            inputs = {
-                input_names[0]: feature_3d,
-                input_names[1]: kp_driving,
-                input_names[2]: kp_source
-            }
+        # Use warping network - now with full dense motion in ONNX
+        input_names = [inp.name for inp in self.warping_network_session.get_inputs()]
+        inputs = {
+            input_names[0]: feature_3d,     # feature_3d
+            input_names[1]: kp_driving,     # kp_driving
+            input_names[2]: kp_source       # kp_source
+        }
 
         warping_outputs = self.warping_network_session.run(None, inputs)
-        warped_feature = warping_outputs[0]
+        warped_feature = warping_outputs[0]  # Final output from warping network
 
         # Use SPADE generator
         spade_input_name = self.spade_generator_session.get_inputs()[0].name
