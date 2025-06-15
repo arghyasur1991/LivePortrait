@@ -197,6 +197,7 @@ def src_preprocess(img):
 
 
 def crop_src_image(models, img):
+    print(f"[DEBUG_CROP_SRC] Input image shape: {img.shape}")
     face_analysis = models["face_analysis"]
     src_face = face_analysis(img)
 
@@ -207,18 +208,29 @@ def crop_src_image(models, img):
         print(f"More than one face detected in the image, only pick one face.")
 
     src_face = src_face[0]
+    print(f"[DEBUG_CROP_SRC] Selected face bbox: {src_face['bbox']}")
+    print(f"[DEBUG_CROP_SRC] Face detection score: {src_face['det_score']}")
+
     lmk = src_face["landmark_2d_106"]  # this is the 106 landmarks from insightface
+    print(f"[DEBUG_CROP_SRC] Initial landmarks shape: {lmk.shape}")
+    print(f"[DEBUG_CROP_SRC] Initial landmarks range: [{lmk.min():.3f}, {lmk.max():.3f}]")
+    print(f"[DEBUG_CROP_SRC] First 5 landmarks: {lmk[:5]}")
 
     # crop the face
     crop_info = crop_image(img, lmk, dsize=512, scale=2.3, vy_ratio=-0.125)
+    print(f"[DEBUG_CROP_SRC] Crop info keys: {list(crop_info.keys())}")
 
     lmk = landmark_runner(models, img, lmk)
+    print(f"[DEBUG_CROP_SRC] Refined landmarks shape: {lmk.shape}")
+    print(f"[DEBUG_CROP_SRC] Refined landmarks range: [{lmk.min():.3f}, {lmk.max():.3f}]")
+    print(f"[DEBUG_CROP_SRC] First 5 refined landmarks: {lmk[:5]}")
 
     crop_info["lmk_crop"] = lmk
     crop_info["img_crop_256x256"] = cv2.resize(
         crop_info["img_crop"], (256, 256), interpolation=cv2.INTER_AREA
     )
     crop_info["lmk_crop_256x256"] = crop_info["lmk_crop"] * 256 / 512
+    print(f"[DEBUG_CROP_SRC] Final crop landmarks 256x256 range: [{crop_info['lmk_crop_256x256'].min():.3f}, {crop_info['lmk_crop_256x256'].max():.3f}]")
 
     return crop_info
 
