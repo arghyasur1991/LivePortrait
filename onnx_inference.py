@@ -16,27 +16,40 @@ def get_face_analysis(det_face, landmark):
         input_size = 192
 
         bbox = face["bbox"]
+        print(f"[DEBUG_GET_LANDMARK] Face bbox: {bbox}")
         w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
         center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
+        print(f"[DEBUG_GET_LANDMARK] Center: {center}, w={w:.3f}, h={h:.3f}")
         rotate = 0
         _scale = input_size / (max(w, h) * 1.5)
+        print(f"[DEBUG_GET_LANDMARK] Scale: {_scale:.6f}")
         aimg, M = face_align(img, center, input_size, _scale, rotate)
+        print(f"[DEBUG_GET_LANDMARK] Aligned image shape: {aimg.shape}")
+        print(f"[DEBUG_GET_LANDMARK] Transform matrix M:\n{M}")
         input_size = tuple(aimg.shape[0:2][::-1])
+        print(f"[DEBUG_GET_LANDMARK] Input size tuple: {input_size}")
 
         aimg = aimg.transpose(2, 0, 1)  # HWC -> CHW
         aimg = np.expand_dims(aimg, axis=0)
         aimg = aimg.astype(np.float32)
+        print(f"[DEBUG_GET_LANDMARK] Preprocessed tensor shape: {aimg.shape}, range: [{aimg.min():.3f}, {aimg.max():.3f}]")
 
         # feedforward
         output = landmark.run(None, {"data": aimg})
         pred = output[0][0]
+        print(f"[DEBUG_GET_LANDMARK] Raw ONNX output shape: {pred.shape}, range: [{pred.min():.3f}, {pred.max():.3f}]")
 
         pred = pred.reshape((-1, 2))
+        print(f"[DEBUG_GET_LANDMARK] Reshaped pred: {pred.shape}, first 3: {pred[:3]}")
         pred[:, 0:2] += 1
         pred[:, 0:2] *= input_size[0] // 2
+        print(f"[DEBUG_GET_LANDMARK] After scaling: first 3: {pred[:3]}")
 
         IM = cv2.invertAffineTransform(M)
+        print(f"[DEBUG_GET_LANDMARK] Inverse transform matrix IM:\n{IM}")
         pred = trans_points2d(pred, IM)
+        print(f"[DEBUG_GET_LANDMARK] Final landmarks: shape={pred.shape}, range=[{pred.min():.3f}, {pred.max():.3f}]")
+        print(f"[DEBUG_GET_LANDMARK] Final first 3 landmarks: {pred[:3]}")
 
         return pred
 
