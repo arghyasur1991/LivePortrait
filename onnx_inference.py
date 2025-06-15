@@ -150,11 +150,19 @@ def get_face_analysis(det_face, landmark):
 
 
 def preprocess(img):
+    print(f"[DEBUG_PREPROCESS] Input shape: {img.shape}, dtype: {img.dtype}")
+    print(f"[DEBUG_PREPROCESS] Input range: [{img.min():.3f}, {img.max():.3f}]")
+
     img = img / 255.0
     img = np.clip(img, 0, 1)  # clip to 0~1
+    print(f"[DEBUG_PREPROCESS] After normalize: [{img.min():.3f}, {img.max():.3f}]")
+
     img = img.transpose(2, 0, 1)  # HxWx3x1 -> 1x3xHxW
     img = np.expand_dims(img, axis=0)
     img = img.astype(np.float32)
+
+    print(f"[DEBUG_PREPROCESS] Final tensor shape: {img.shape}")
+    print(f"[DEBUG_PREPROCESS] Final tensor range: [{img.min():.3f}, {img.max():.3f}]")
 
     return img
 
@@ -239,6 +247,9 @@ def landmark_runner(models, img, lmk):
 
 
 def extract_feature_3d(models, x):
+    print(f"[DEBUG_EXTRACT_FEATURE_3D] Input tensor shape: {x.shape}")
+    print(f"[DEBUG_EXTRACT_FEATURE_3D] Input tensor range: [{x.min():.3f}, {x.max():.3f}]")
+
     net = models["appearance_feature_extractor"]
 
     # feedforward
@@ -246,15 +257,24 @@ def extract_feature_3d(models, x):
     f_s = output[0]
     f_s = f_s.astype(np.float32)
 
+    print(f"[DEBUG_EXTRACT_FEATURE_3D] Output shape: {f_s.shape}")
+    print(f"[DEBUG_EXTRACT_FEATURE_3D] Output range: [{f_s.min():.3f}, {f_s.max():.3f}]")
+
     return f_s
 
 
 def get_kp_info(models, x):
+    print(f"[DEBUG_GET_KP_INFO] Input tensor shape: {x.shape}")
+    print(f"[DEBUG_GET_KP_INFO] Input tensor range: [{x.min():.3f}, {x.max():.3f}]")
+
     net = models["motion_extractor"]
 
     # feedforward
     output = net.run(None, {"img": x})
     pitch, yaw, roll, t, exp, scale, kp = output
+
+    print(f"[DEBUG_GET_KP_INFO] Raw outputs - pitch: {pitch.shape}, yaw: {yaw.shape}, roll: {roll.shape}")
+    print(f"[DEBUG_GET_KP_INFO] Raw outputs - t: {t.shape}, exp: {exp.shape}, scale: {scale.shape}, kp: {kp.shape}")
 
     kp_info = dict(pitch=pitch, yaw=yaw, roll=roll, t=t, exp=exp, scale=scale, kp=kp)
 
@@ -273,6 +293,12 @@ def get_kp_info(models, x):
     bs = kp_info["kp"].shape[0]
     kp_info["kp"] = kp_info["kp"].reshape(bs, -1, 3)  # BxNx3
     kp_info["exp"] = kp_info["exp"].reshape(bs, -1, 3)  # BxNx3
+
+    print(f"[DEBUG_GET_KP_INFO] Processed - pitch: {kp_info['pitch']}, yaw: {kp_info['yaw']}, roll: {kp_info['roll']}")
+    print(f"[DEBUG_GET_KP_INFO] Processed - t: {kp_info['t']}, scale: {kp_info['scale']}")
+    print(f"[DEBUG_GET_KP_INFO] Processed - kp shape: {kp_info['kp'].shape}, exp shape: {kp_info['exp'].shape}")
+    print(f"[DEBUG_GET_KP_INFO] Processed - kp range: [{kp_info['kp'].min():.3f}, {kp_info['kp'].max():.3f}]")
+    print(f"[DEBUG_GET_KP_INFO] Processed - exp range: [{kp_info['exp'].min():.3f}, {kp_info['exp'].max():.3f}]")
 
     return kp_info
 
@@ -313,6 +339,10 @@ def warping_spade(models, feature_3d, kp_source, kp_driving):
     kp_source: BxNx3
     kp_driving: BxNx3
     """
+    print(f"[DEBUG_WARPING_SPADE] Input shapes - feature_3d: {feature_3d.shape}, kp_source: {kp_source.shape}, kp_driving: {kp_driving.shape}")
+    print(f"[DEBUG_WARPING_SPADE] Feature3D range: [{feature_3d.min():.3f}, {feature_3d.max():.3f}]")
+    print(f"[DEBUG_WARPING_SPADE] KpSource range: [{kp_source.min():.3f}, {kp_source.max():.3f}]")
+    print(f"[DEBUG_WARPING_SPADE] KpDriving range: [{kp_driving.min():.3f}, {kp_driving.max():.3f}]")
 
     # feedforward
     net = models["warping_spade"]
@@ -324,6 +354,10 @@ def warping_spade(models, feature_3d, kp_source, kp_driving):
                 "kp_source": kp_source,
             },
         )
+
+    print(f"[DEBUG_WARPING_SPADE] Output shape: {output[0].shape}")
+    print(f"[DEBUG_WARPING_SPADE] Output range: [{output[0].min():.3f}, {output[0].max():.3f}]")
+
     return output[0]
 
 
@@ -387,15 +421,26 @@ def predict(frame_id, models, x_s_info, R_s, f_s, x_s, img, pred_info):
     x_c_s = x_s_info["kp"]
     x_d_new = scale_new * (x_c_s @ R_new + delta_new) + t_new
 
+    print(f"[DEBUG_PREDICT] xCs range: [{x_c_s.min():.3f}, {x_c_s.max():.3f}]")
+    print(f"[DEBUG_PREDICT] xDNew range: [{x_d_new.min():.3f}, {x_d_new.max():.3f}]")
+    print(f"[DEBUG_PREDICT] scaleNew: {scale_new}")
+    print(f"[DEBUG_PREDICT] tNew: {t_new}")
+
     # with stitching and without retargeting
     x_d_new = stitching(models, x_s, x_d_new)
 
     out = warping_spade(models, f_s, x_s, x_d_new)
     # out = out["out"]
+    print(f"[DEBUG_PREDICT] Raw warping output shape: {out.shape}")
+    print(f"[DEBUG_PREDICT] Raw warping output range: [{out.min():.3f}, {out.max():.3f}]")
+
     out = out.transpose(0, 2, 3, 1)  # 1x3xHxW -> 1xHxWx3
     out = np.clip(out, 0, 1)  # clip to 0~1
     out = (out * 255).astype(np.uint8)  # 0~1 -> 0~255
     I_p = out[0]
+
+    print(f"[DEBUG_PREDICT] Final output shape: {I_p.shape}")
+    print(f"[DEBUG_PREDICT] Final output range: [{I_p.min()}, {I_p.max()}]")
 
     return I_p, pred_info
 
@@ -548,6 +593,8 @@ class LivePortraitWrapper():
 
         # Process each driving image
         for frame_id, driving_img_path in enumerate(driving_images):
+            if frame_id > 0: # debug 1st frame
+                break
             print(f"Processing frame {frame_id + 1}/{len(driving_images)}: {os.path.basename(driving_img_path)}")
 
             # Load driving image
