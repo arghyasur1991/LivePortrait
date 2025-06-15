@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 import onnxruntime
 import time
+import os
+import glob
+import argparse
 from utils_crop import face_align, trans_points2d, distance2bbox, distance2kps, nms_boxes,\
                         crop_image, softmax, calculate_distance_ratio, get_rotation_matrix,\
                         transform_keypoint, concat_frame, prepare_paste_back, paste_back
@@ -424,7 +427,13 @@ class LivePortraitWrapper():
         self.flg_composite = False
         self.pred_info = {'lmk':None, 'x_d_0_info':None}
 
-    def execute(self, imgpath, videopath):
+    def execute(self, imgpath, videopath, output_video='output.mp4', dump_frames=False, save_images=False, frames_folder='input_frames', images_folder='output_images'):
+        # Create folders if needed
+        if dump_frames:
+            os.makedirs(frames_folder, exist_ok=True)
+        if save_images:
+            os.makedirs(images_folder, exist_ok=True)
+
         img = cv2.imread(imgpath)
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
@@ -448,20 +457,25 @@ class LivePortraitWrapper():
         # prepare for pasteback
         mask_ori = prepare_paste_back(self.mask_crop, crop_info["M_c2o"], dsize=(src_img.shape[1], src_img.shape[0]))
 
-        video_writer = cv2.VideoWriter('output.mp4', cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), fps, (f_w, f_h))
+        video_writer = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), fps, (f_w, f_h))
         frame_id = 0
         while True:
             ret, frame = capture.read()
             if (cv2.waitKey(1) & 0xFF == ord("q")) or not ret:
                 break
 
+            # Dump input frame if requested
+            if dump_frames:
+                frame_filename = f"{frame_id:08d}.png"
+                frame_path = os.path.join(frames_folder, frame_filename)
+                cv2.imwrite(frame_path, frame)
+
             # inference
             img_rgb = frame[:, :, ::-1]  # BGR -> RGB
             a = time.time()
             I_p, self.pred_info = predict(frame_id, self.models, x_s_info, R_s, f_s, x_s, img_rgb, self.pred_info)
             b = time.time()
-            print(f"frame_id={frame_id}, predict waste time {b-a} s")
-            frame_id += 1
+            print(f"frame_id={frame_id}, predict waste time {b-a:.3f} s")
 
             if self.flg_composite:
                 driving_img = concat_frame(img_rgb, img_crop_256x256, I_p)
@@ -469,20 +483,140 @@ class LivePortraitWrapper():
                 driving_img = paste_back(I_p, crop_info["M_c2o"], src_img, mask_ori)
             driving_img = driving_img[:, :, ::-1]  # RGB -> BGR
 
-            # cv2.imshow('frame', driving_img)
-            # key = cv2.waitKey(1)
-            # if key == 27:  # ESC
-            #     break
+            # Save output image if requested
+            if save_images:
+                output_filename = f"{frame_id:08d}.png"
+                output_path = os.path.join(images_folder, output_filename)
+                cv2.imwrite(output_path, driving_img)
+
+                # Also save raw warped result for debugging
+                # raw_output_path = os.path.join(images_folder, f"raw_{frame_id:04d}.png")
+                # I_p_bgr = I_p[:, :, ::-1]  # RGB -> BGR for OpenCV
+                # cv2.imwrite(raw_output_path, I_p_bgr)
 
             video_writer.write(driving_img)
+            frame_id += 1
 
         capture.release()
         video_writer.release()
         cv2.destroyAllWindows()
 
+        if dump_frames:
+            print(f"Input frames saved to: {frames_folder}")
+        if save_images:
+            print(f"Output images saved to: {images_folder}")
+
+    def execute_images(self, imgpath, driving_folder, output_folder):
+        """Execute LivePortrait with folder of driving images and output folder of results"""
+        # Create output folder if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Load and preprocess source image
+        img = cv2.imread(imgpath)
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        img = img[:, :, ::-1]  # BGR -> RGB
+        src_img = src_preprocess(img)
+        crop_info = crop_src_image(self.models, src_img)
+
+        # prepare_source
+        img_crop_256x256 = crop_info["img_crop_256x256"]
+        I_s = preprocess(img_crop_256x256)
+
+        x_s_info = get_kp_info(self.models, I_s)
+        R_s = get_rotation_matrix(x_s_info["pitch"], x_s_info["yaw"], x_s_info["roll"])
+        f_s = extract_feature_3d(self.models, I_s)
+        x_s = transform_keypoint(x_s_info)
+
+        # Get list of driving images
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+        driving_images = []
+        for ext in image_extensions:
+            driving_images.extend(glob.glob(os.path.join(driving_folder, ext)))
+            driving_images.extend(glob.glob(os.path.join(driving_folder, ext.upper())))
+
+        driving_images.sort()  # Sort for consistent ordering
+
+        if len(driving_images) == 0:
+            print(f"No images found in driving folder: {driving_folder}")
+            return
+
+        print(f"Found {len(driving_images)} driving images")
+
+        # prepare for pasteback
+        mask_ori = prepare_paste_back(self.mask_crop, crop_info["M_c2o"], dsize=(src_img.shape[1], src_img.shape[0]))
+
+        # Process each driving image
+        for frame_id, driving_img_path in enumerate(driving_images):
+            print(f"Processing frame {frame_id + 1}/{len(driving_images)}: {os.path.basename(driving_img_path)}")
+
+            # Load driving image
+            # get file name from driving_img_path
+            file_name = os.path.basename(driving_img_path)
+            frame = cv2.imread(driving_img_path)
+            if frame is None:
+                print(f"Failed to load image: {driving_img_path}")
+                continue
+
+            # inference
+            img_rgb = frame[:, :, ::-1]  # BGR -> RGB
+            a = time.time()
+            I_p, self.pred_info = predict(frame_id, self.models, x_s_info, R_s, f_s, x_s, img_rgb, self.pred_info)
+            b = time.time()
+            print(f"frame_id={frame_id}, predict waste time {b-a:.3f} s")
+
+            if self.flg_composite:
+                driving_img = concat_frame(img_rgb, img_crop_256x256, I_p)
+            else:
+                driving_img = paste_back(I_p, crop_info["M_c2o"], src_img, mask_ori)
+            driving_img = driving_img[:, :, ::-1]  # RGB -> BGR
+
+            # Save output image
+            output_filename = f"{file_name}"
+            output_path = os.path.join(output_folder, output_filename)
+            cv2.imwrite(output_path, driving_img)
+
+            # # Also save the raw warped result for debugging
+            # raw_output_path = os.path.join(output_folder, f"{file_name}.png")
+            # I_p_bgr = I_p[:, :, ::-1]  # RGB -> BGR for OpenCV
+            # cv2.imwrite(raw_output_path, I_p_bgr)
+
+        print(f"Processing complete. Results saved to: {output_folder}")
+
 if __name__=='__main__':
+    parser = argparse.ArgumentParser(description='LivePortrait ONNX Inference')
+    parser.add_argument('--source', '-s', required=True, help='Path to source image')
+    parser.add_argument('--driving', '-d', required=True, help='Path to driving video or folder of images')
+    parser.add_argument('--output', '-o', help='Output path (video file or folder for images)')
+    parser.add_argument('--mode', '-m', choices=['video', 'images'], default='video',
+                       help='Processing mode: video (default) or images')
+    parser.add_argument('--dump_frames', action='store_true',
+                       help='Dump input video frames to folder (video mode only)')
+    parser.add_argument('--save_images', action='store_true',
+                       help='Save output images in addition to video (video mode only)')
+    parser.add_argument('--frames_folder', default='input_frames',
+                       help='Folder to save input video frames (default: input_frames)')
+    parser.add_argument('--images_folder', default='output_images',
+                       help='Folder to save output images (default: output_images)')
+
+    args = parser.parse_args()
+
     live_portrait_pipeline = LivePortraitWrapper()
 
-    imgpath = '0.jpg'
-    videopath = 'd0.mp4'
-    live_portrait_pipeline.execute(imgpath, videopath)
+    if args.mode == 'images':
+        # Image folder mode
+        if args.output is None:
+            args.output = 'output_images'
+        live_portrait_pipeline.execute_images(args.source, args.driving, args.output)
+    else:
+        # Video mode with optional frame dumping and image saving
+        output_video = args.output if args.output else 'output.mp4'
+        live_portrait_pipeline.execute(
+            args.source,
+            args.driving,
+            output_video=output_video,
+            dump_frames=True, # args.dump_frames,
+            save_images=True, # args.save_images,
+            frames_folder=args.frames_folder,
+            images_folder=args.images_folder
+        )
