@@ -53,6 +53,8 @@ def get_face_analysis(det_face, landmark):
         print(f"[DEBUG_GET_LANDMARK] Final landmarks: shape={pred.shape}, range=[{pred.min():.3f}, {pred.max():.3f}]")
         print(f"[DEBUG_GET_LANDMARK] Final first 3 landmarks: {pred[:3]}")
 
+        # print the first 10 values of the tensor
+        print(f"[DEBUG_GET_LANDMARK] First 10 values of the tensor: {pred[0:10]}")
         return pred
 
     def face_analysis(img):
