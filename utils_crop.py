@@ -50,6 +50,7 @@ def parse_pt2_from_pt106(pt106, use_lip=True):
         pt2 = np.stack([pt_center_eye, pt_center_lip], axis=0)
     else:
         pt2 = np.stack([pt_left_eye, pt_right_eye], axis=0)
+    print(f"[DEBUG_PARSE_PT2_FROM_PT106] pt2: {pt2[0]}, {pt2[1]}")
     return pt2
 
 
@@ -62,6 +63,7 @@ def parse_pt2_from_pt_x(pts, use_lip=True):
         pt2[1, 0] = pt2[0, 0] - v[1]
         pt2[1, 1] = pt2[0, 1] + v[0]
 
+    print(f"[DEBUG_PARSE_PT2_FROM_PT_X] pt2: {pt2[0]}, {pt2[1]}")
     return pt2
 
 
@@ -89,11 +91,13 @@ def parse_rect_from_landmark(
     else:
         uy /= l
     ux = np.array((uy[1], -uy[0]), dtype=np.float32)
+    print(f"[DEBUG_PARSE_RECT_FROM_LANDMARK] ux: {ux}, uy: {uy}")
 
     # the rotation degree of the x-axis, the clockwise is positive, the counterclockwise is negative (image coordinate system)
     angle = acos(ux[0])
     if ux[1] < 0:
         angle = -angle
+    print(f"[DEBUG_PARSE_RECT_FROM_LANDMARK] angle: {angle}")
 
     # rotation matrix
     M = np.array([ux, uy])
@@ -142,12 +146,15 @@ def _estimate_similar_transform_from_pts(
         vy_ratio=vy_ratio,
         use_lip=kwargs.get("use_lip", True),
     )
+    print(f"[DEBUG_ESTIMATE_SIMILAR_TRANSFORM_FROM_PTS] center: {center}, size: {size}, angle: {angle}")
 
     s = dsize / size[0]  # scale
     tgt_center = np.array([dsize / 2, dsize / 2], dtype=np.float32)  # center of dsize
+    print(f"[DEBUG_ESTIMATE_SIMILAR_TRANSFORM_FROM_PTS] s: {s}, tgt_center: {tgt_center}, flag_do_rot: {flag_do_rot}")
 
     if flag_do_rot:
         costheta, sintheta = cos(angle), sin(angle)
+        print(f"[DEBUG_ESTIMATE_SIMILAR_TRANSFORM_FROM_PTS] costheta: {costheta}, sintheta: {sintheta}")
         cx, cy = center[0], center[1]  # ori center
         tcx, tcy = tgt_center[0], tgt_center[1]  # target center
         # need to infer
@@ -173,12 +180,14 @@ def _estimate_similar_transform_from_pts(
 
     M_INV_H = np.vstack([M_INV, np.array([0, 0, 1])])
     M = np.linalg.inv(M_INV_H)
-
+    print(f"[DEBUG_ESTIMATE_SIMILAR_TRANSFORM_FROM_PTS] M: {M[0, 0]:.2f}, {M[0, 1]:.2f}, {M[0, 2]:.2f}, {M[1, 0]:.2f}, {M[1, 1]:.2f}, {M[1, 2]:.2f}")
+    print(f"[DEBUG_ESTIMATE_SIMILAR_TRANSFORM_FROM_PTS] M_INV: {M_INV[0, 0]:.2f}, {M_INV[0, 1]:.2f}, {M_INV[0, 2]:.2f}, {M_INV[1, 0]:.2f}, {M_INV[1, 1]:.2f}, {M_INV[1, 2]:.2f}")
     # M_INV is from the original image to the cropped image, M is from the cropped image to the original image
     return M_INV, M[:2, ...]
 
 
 def crop_image(img, pts: np.ndarray, dsize=224, scale=1.5, vy_ratio=-0.1):
+    print(f"[DEBUG_CROP_IMAGE] pts: {pts}")
     M_INV, _ = _estimate_similar_transform_from_pts(
         pts,
         dsize=dsize,
@@ -242,13 +251,16 @@ def distance2kps(points, distance, max_shape=None):
 def face_align(data, center, output_size, scale, rotation):
     scale_ratio = scale
     rot = float(rotation) * np.pi / 180.0
-    
-    trans_M = np.array([[scale_ratio*cos(rot), -scale_ratio*sin(rot), output_size*0.5-center[0]*scale_ratio], 
-                        [scale_ratio*sin(rot), scale_ratio*cos(rot), output_size*0.5-center[1]*scale_ratio], 
+
+    trans_M = np.array([[scale_ratio*cos(rot), -scale_ratio*sin(rot), output_size*0.5-center[0]*scale_ratio],
+                        [scale_ratio*sin(rot), scale_ratio*cos(rot), output_size*0.5-center[1]*scale_ratio],
                         [0, 0, 1]], dtype=np.float32)
     M = trans_M[0:2]
+    # print M
+    print(f"[DEBUG_FACE_ALIGN] M: {M}")
+    cv2.imwrite("data.png", data)
     cropped = cv2.warpAffine(data, M, (output_size, output_size), borderValue=0.0)
-
+    cv2.imwrite("cropped.png", cropped)
     return cropped, M
 
 

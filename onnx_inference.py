@@ -32,7 +32,9 @@ def get_face_analysis(det_face, landmark):
         aimg = aimg.transpose(2, 0, 1)  # HWC -> CHW
         aimg = np.expand_dims(aimg, axis=0)
         aimg = aimg.astype(np.float32)
-        print(f"[DEBUG_GET_LANDMARK] Preprocessed tensor shape: {aimg.shape}, range: [{aimg.min():.3f}, {aimg.max():.3f}]")
+        print(f"[DEBUG_GET_LANDMARK] Preprocessed tensor shape: {aimg.shape}, range: [{aimg.min():.3f}, {aimg.max():.3f}], mean: {aimg.mean():.3f}")
+        # Print the first 10 values of the tensor
+        print(f"[DEBUG_GET_LANDMARK] First 10 values of the tensor: {aimg[0, 0, 0, 0:10]}")
 
         # feedforward
         output = landmark.run(None, {"data": aimg})
@@ -87,6 +89,7 @@ def get_face_analysis(det_face, landmark):
         for idx, stride in enumerate(feat_stride_fpn):
             scores = output[idx]
             bbox_preds = output[idx + fmc]
+            print(f"[DEBUG_FACE_ANALYSIS] bbox_preds: {bbox_preds[0]}, {bbox_preds[1]}, {bbox_preds[2]}, {bbox_preds[3]}")
             bbox_preds = bbox_preds * stride
             kps_preds = output[idx + fmc * 2] * stride
             height = input_size // stride
@@ -123,6 +126,7 @@ def get_face_analysis(det_face, landmark):
         scores = np.vstack(scores_list)
         scores_ravel = scores.ravel()
         order = scores_ravel.argsort()[::-1]
+
         bboxes = np.vstack(bboxes_list) / det_scale
         kpss = np.vstack(kpss_list) / det_scale
         pre_det = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
@@ -131,6 +135,7 @@ def get_face_analysis(det_face, landmark):
         nms_thresh = 0.4
         keep = nms_boxes(pre_det, [1 for s in pre_det], nms_thresh)
         bboxes = pre_det[keep, :]
+        print(f"[DEBUG_FACE_ANALYSIS] bboxes_list: {bboxes_list}")
         kpss = kpss[order, :, :]
         kpss = kpss[keep, :, :]
 
@@ -231,6 +236,7 @@ def crop_src_image(models, img):
 
     # crop the face
     crop_info = crop_image(img, lmk, dsize=512, scale=2.3, vy_ratio=-0.125)
+    cv2.imwrite("crop_info0.png", crop_info["img_crop"])
     print(f"[DEBUG_CROP_SRC] Crop info keys: {list(crop_info.keys())}")
 
     lmk = landmark_runner(models, img, lmk)
@@ -588,6 +594,10 @@ class LivePortraitWrapper():
         img = img[:, :, ::-1]  # BGR -> RGB
         src_img = src_preprocess(img)
         crop_info = crop_src_image(self.models, src_img)
+
+        cv2.imwrite("crop_info.png", crop_info["img_crop_256x256"])
+
+        return
 
         # prepare_source
         img_crop_256x256 = crop_info["img_crop_256x256"]
