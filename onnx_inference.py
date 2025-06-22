@@ -3,6 +3,10 @@ import numpy as np
 import onnxruntime
 import time
 import os
+import onnx
+from onnx import helper, numpy_helper
+import functools
+import operator
 import glob
 import argparse
 from utils_crop import face_align, trans_points2d, distance2bbox, distance2kps, nms_boxes,\
@@ -76,6 +80,8 @@ def get_face_analysis(det_face, landmark):
         det_img = det_img.transpose(2, 0, 1)  # HWC -> CHW
         det_img = np.expand_dims(det_img, axis=0)
         det_img = det_img.astype(np.float32)
+
+        print(f"[DEBUG_FACE_ANALYSIS] det_img shape: {det_img.shape}")
 
         # feedforward
         output = det_face.run(None, {"input.1": det_img})
@@ -480,14 +486,26 @@ def predict(frame_id, models, x_s_info, R_s, f_s, x_s, img, pred_info):
 class LivePortraitWrapper():
     def __init__(self):
         so = onnxruntime.SessionOptions()
-        so.log_severity_level = 3
         appearance_feature_extractor = onnxruntime.InferenceSession("weights/appearance_feature_extractor.onnx", so)
         motion_extractor = onnxruntime.InferenceSession("weights/motion_extractor.onnx", so)
         warping_spade = onnxruntime.InferenceSession("weights/warping_spade.onnx", so)
         stitching_module = onnxruntime.InferenceSession("weights/stitching.onnx", so)
         landmark_run = onnxruntime.InferenceSession("weights/landmark.onnx", so)
-        det_face = onnxruntime.InferenceSession("weights/det_10g.onnx", so)
+
+        so1 = onnxruntime.SessionOptions()
+        # so1.log_severity_level = 0 #3
+        providers = [
+            ("CoreMLExecutionProvider", {
+                "MLComputeUnits": "CPUAndGPU",  # Prefer GPU but allow fallback
+                "RequireStaticInputShapes": "0",  # <- This is the fix
+                "ProfileComputePlan": "1"         # Optional: to see what runs on GPU/CPU
+            }),
+            "CPUExecutionProvider"
+        ]
+        det_face = onnxruntime.InferenceSession("weights/det_10g_fixed.onnx", so1, providers=providers)
         landmark = onnxruntime.InferenceSession("weights/2d106det.onnx", so)
+
+        # onnxruntime.set_default_logger_severity(0)
 
         face_analysis = get_face_analysis(det_face, landmark)
 
@@ -599,8 +617,6 @@ class LivePortraitWrapper():
 
         cv2.imwrite("crop_info.png", crop_info["img_crop_256x256"])
 
-        return
-
         # prepare_source
         img_crop_256x256 = crop_info["img_crop_256x256"]
         I_s = preprocess(img_crop_256x256)
@@ -667,6 +683,68 @@ class LivePortraitWrapper():
 
         print(f"Processing complete. Results saved to: {output_folder}")
 
+
+
+model_path = "weights/det_10g.onnx"
+input_tensor_name = ""  # Replace with actual input name
+dummy_input = np.random.randn(1, 3, 512, 512).astype(np.float32)  # Adjust shape if needed
+
+target_shape = np.array([3200, 1], dtype=np.int64)
+
+# === Load original model ===
+original_model = onnx.load(model_path)
+graph = original_model.graph
+
+output_path = "det_10g_fixed.onnx"
+new_nodes = []
+new_initializers = []
+
+def fix_onnx_inference():
+    model = onnx.load(model_path)
+    graph = model.graph
+    new_nodes = []
+    new_initializers = []
+
+    new_nodes = []
+
+    for output in graph.output:
+        orig_name = output.name
+        flat_output_name = orig_name + "_flat"
+
+        # Create flatten node
+        flatten_node = helper.make_node(
+            "Flatten",
+            inputs=[orig_name],
+            outputs=[flat_output_name],
+            name=f"Flatten_{orig_name}",
+            axis=1  # flatten all but first axis (safe for image data, can be 0 if batch dim missing)
+        )
+        new_nodes.append(flatten_node)
+
+        # Replace graph output
+        output.name = flat_output_name
+        output.type.tensor_type.shape.Clear()  # let ONNX infer
+
+    # Add nodes to graph
+    graph.node.extend(new_nodes)
+
+    onnx.save(model, output_path)
+    try:
+        input_tensor_name = "input.1"
+        session = onnxruntime.InferenceSession(output_path, providers=[
+            ("CoreMLExecutionProvider", {"MLComputeUnits": "CPUAndGPU"}),
+            "CPUExecutionProvider"
+        ])
+        session.run(None, {input_tensor_name: dummy_input})
+        print("✅ Fixes the crash!")
+        return True  # success
+    except Exception as e:
+        print(f"❌ Still crashes: {e}")
+        print("❌ Still crashes")
+        return False  # failed
+
+
+
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description='LivePortrait ONNX Inference')
     parser.add_argument('--source', '-s', required=True, help='Path to source image')
@@ -683,7 +761,15 @@ if __name__=='__main__':
     parser.add_argument('--images_folder', default='output_images',
                        help='Folder to save output images (default: output_images)')
 
+
+    parser.add_argument('--fixonnx', action='store_true',
+                       help='Fix onnx inference')
+
     args = parser.parse_args()
+
+    if args.fixonnx:
+        fix_onnx_inference()
+        exit()
 
     live_portrait_pipeline = LivePortraitWrapper()
 
