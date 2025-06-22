@@ -83,9 +83,12 @@ def get_face_analysis(det_face, landmark):
 
         print(f"[DEBUG_FACE_ANALYSIS] det_img shape: {det_img.shape}")
 
+        # det_face.enable_profiling()
         # feedforward
         output = det_face.run(None, {"input.1": det_img})
 
+        profile_path = det_face.end_profiling()
+        print(f"Saved profiling to: {profile_path}")
         scores_list = []
         bboxes_list = []
         kpss_list = []
@@ -491,6 +494,7 @@ class LivePortraitWrapper():
         warping_spade = onnxruntime.InferenceSession("weights/warping_spade.onnx", so)
         stitching_module = onnxruntime.InferenceSession("weights/stitching.onnx", so)
         landmark_run = onnxruntime.InferenceSession("weights/landmark.onnx", so)
+        landmark = onnxruntime.InferenceSession("weights/2d106det.onnx", so)
 
         so1 = onnxruntime.SessionOptions()
         # so1.log_severity_level = 0 #3
@@ -502,8 +506,8 @@ class LivePortraitWrapper():
             }),
             "CPUExecutionProvider"
         ]
+        so1.enable_profiling = True  # ✅ This is the correct flag
         det_face = onnxruntime.InferenceSession("weights/det_10g_fixed.onnx", so1, providers=providers)
-        landmark = onnxruntime.InferenceSession("weights/2d106det.onnx", so)
 
         # onnxruntime.set_default_logger_severity(0)
 
@@ -743,7 +747,29 @@ def fix_onnx_inference():
         print("❌ Still crashes")
         return False  # failed
 
+import json
+from collections import defaultdict
 
+def print_profile():
+    with open("onnxruntime_profile__2025-06-22_19-22-35.json", "r") as f:
+        data = json.load(f)
+
+    provider_nodes = defaultdict(list)
+
+    for entry in data:
+        if entry.get("cat") == "Node":
+            name = entry.get("name")
+            provider = entry.get("args", {}).get("provider", "Unknown")
+            provider_nodes[provider].append(name)
+
+    # Print stats
+    print("📊 Execution Provider Breakdown:")
+    for provider, nodes in provider_nodes.items():
+        print(f"{provider}: {len(nodes)} nodes")
+        for node in nodes[:10]:  # print first 10 nodes only
+            print(f"  - {node}")
+        if len(nodes) > 10:
+            print(f"  ... and {len(nodes)-10} more\n")
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description='LivePortrait ONNX Inference')
@@ -764,11 +790,17 @@ if __name__=='__main__':
 
     parser.add_argument('--fixonnx', action='store_true',
                        help='Fix onnx inference')
+    parser.add_argument('--print_profile', action='store_true',
+                       help='Print profile')
 
     args = parser.parse_args()
 
     if args.fixonnx:
         fix_onnx_inference()
+        exit()
+
+    if args.print_profile:
+        print_profile()
         exit()
 
     live_portrait_pipeline = LivePortraitWrapper()
