@@ -695,7 +695,7 @@ target_shape = np.array([3200, 1], dtype=np.int64)
 original_model = onnx.load(model_path)
 graph = original_model.graph
 
-output_path = "det_10g_fixed.onnx"
+output_path = "weights/det_10g_fixed.onnx"
 new_nodes = []
 new_initializers = []
 
