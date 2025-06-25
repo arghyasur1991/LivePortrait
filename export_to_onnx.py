@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-ONNX Export Script for LivePortrait Models
-This script exports all LivePortrait PyTorch models to ONNX format for faster inference.
-
-Usage:
-    conda activate LivePortrait
-    python export_to_onnx.py --output_dir ./onnx_models --export_int8
+ONNX Export and Processing Script for LivePortrait Models
+This script loads existing ONNX models, optimizes them, and converts to different precisions.
 """
 
 import os
@@ -15,636 +11,529 @@ import onnxruntime as ort
 import numpy as np
 import argparse
 import json
-import yaml
 from pathlib import Path
-from typing import Dict, Any, Tuple
+import shutil
+from onnxsim import simplify
 
 # INT8 quantization support
 try:
     from onnxruntime.quantization import quantize_dynamic, QuantType
+    from onnxruntime.quantization.calibrate import CalibrationDataReader
+    from onnxruntime.quantization import quantize_static, CalibrationMethod
     INT8_AVAILABLE = True
     print("✓ INT8 quantization support available")
 except ImportError:
     INT8_AVAILABLE = False
     print("⚠️ INT8 quantization not available. Install with: pip install onnxruntime")
 
-# Disable attention optimizations for ONNX export
-torch.backends.cuda.enable_math_sdp(False)
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cudnn.allow_tf32 = False
-torch.backends.cuda.matmul.allow_tf32 = False
+from onnxruntime.transformers.float16 import convert_float_to_float16
+from onnxruntime.transformers.fusion_options import FusionOptions
+from onnxruntime.transformers.optimizer import optimize_model
 
-# Add the project root to Python path
-import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+@torch.no_grad()
+def tune_model(
+    model_path: str,
+    model_type: str,
+    fp16: bool
+):
+    """Optimize ONNX model using ONNX Runtime transformers"""
+    model_dir = os.path.dirname(model_path)
 
-from src.config.inference_config import InferenceConfig
-from src.utils.helper import load_model
+    # Set optimization options based on model type
+    optimization_options = FusionOptions(model_type)
 
+    # Disable problematic optimizations for LivePortrait models
+    optimization_options.enable_group_norm = False
+    optimization_options.enable_nhwc_conv = False
+    optimization_options.enable_qordered_matmul = False
+    optimization_options.enable_bias_splitgelu = False
+    optimization_options.enable_bias_add = False
+    optimization_options.enable_skip_layer_norm = model_type not in ["warping", "spade"]
+    optimization_options.enable_gelu = model_type not in ["warping", "spade"]
 
-def export_appearance_feature_extractor_to_onnx(model, output_path: str, device='cpu', opset_version=20):
-    """Export Appearance Feature Extractor (A) to ONNX"""
-    print(f"Exporting Appearance Feature Extractor to {output_path}")
+    optimizer = optimize_model(
+        input=model_path,
+        model_type=model_type,
+        opt_level=0,
+        optimization_options=optimization_options,
+        use_gpu=False,
+        only_onnxruntime=False
+    )
 
-    output_path = str(output_path)
-    device = torch.device('cpu')
-
-    # Move model to cpu and eval mode
-    model = model.to(device)
-    model.eval()
-
-    # Create dummy input
-    source_image = torch.randn(1, 3, 256, 256, device=device)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            model,
-            source_image,
-            output_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['source_image'],
-            output_names=['feature_3d'],
-            dynamic_axes={
-                'source_image': {0: 'batch_size'},
-                'feature_3d': {0: 'batch_size'}
-            },
-            verbose=False,
-            training=torch.onnx.TrainingMode.EVAL
+    if fp16:
+        optimizer.convert_float_to_float16(
+            keep_io_types=True,
+            disable_shape_infer=True,
+            op_block_list=['RandomNormalLike']
         )
 
-    print(f"✓ Appearance Feature Extractor exported successfully")
+    optimizer.topological_sort()
 
+    # Handle external data file cleanup
+    data_location = f"{model_path}.data"
+    if os.path.exists(data_location):
+        os.remove(data_location)
 
-def export_motion_extractor_to_onnx(model, output_path: str, device='cpu', opset_version=20):
-    """Export Motion Extractor (M) to ONNX"""
-    print(f"Exporting Motion Extractor to {output_path}")
+    onnx.save_model(
+        optimizer.model,
+        model_path,
+        save_as_external_data=False,
+        all_tensors_to_one_file=True,
+        location=None,
+        convert_attribute=False,
+    )
 
+def process_existing_onnx_model(input_path, output_path, model_name, model_type="general"):
+    """Process an existing ONNX model by copying and optimizing it"""
+    print(f"Processing {model_name} from {input_path}")
+
+    # Convert paths to strings
+    input_path = str(input_path)
     output_path = str(output_path)
-    device = torch.device('cpu')
 
-    # Move model to cpu and eval mode
-    model = model.to(device)
-    model.eval()
-
-    # Create dummy input
-    input_image = torch.randn(1, 3, 256, 256, device=device)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            model,
-            input_image,
-            output_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['input_image'],
-            output_names=['pitch', 'yaw', 'roll', 't', 'exp', 'scale', 'kp'],
-            dynamic_axes={
-                'input_image': {0: 'batch_size'},
-                'pitch': {0: 'batch_size'},
-                'yaw': {0: 'batch_size'},
-                'roll': {0: 'batch_size'},
-                't': {0: 'batch_size'},
-                'exp': {0: 'batch_size'},
-                'scale': {0: 'batch_size'},
-                'kp': {0: 'batch_size'}
-            },
-            verbose=False,
-            training=torch.onnx.TrainingMode.EVAL
-        )
-
-    print(f"✓ Motion Extractor exported successfully")
-
-
-def export_warping_network_to_onnx(model, output_path: str, device='cpu', opset_version=20):
-    """Export Warping Network (W) to ONNX using original grid_sample with opset 20"""
-    print(f"Exporting Warping Network to {output_path}")
-
-    output_path = str(output_path)
-    device = torch.device('cpu')
-
-    class WarpingNetworkWrapper(torch.nn.Module):
-        def __init__(self, original_model):
-            super().__init__()
-            self.warping_network = original_model
-
-        def forward(self, feature_3d, kp_driving, kp_source):
-            """
-            Use the original warping network with native grid_sample
-            feature_3d: (B, C, D, H, W)
-            kp_driving: (B, num_kp, 3)
-            kp_source: (B, num_kp, 3)
-            """
-            # Call the original warping network with CORRECT argument order
-            result = self.warping_network(feature_3d, kp_driving, kp_source)
-
-            # Handle different return formats
-            if isinstance(result, dict):
-                out = result.get('out', result.get('warped_feature'))
-                occlusion_map = result.get('occlusion_map')
-                deformation = result.get('deformation')
-            elif isinstance(result, (list, tuple)):
-                out = result[0] if len(result) > 0 else None
-                occlusion_map = result[1] if len(result) > 1 else None
-                deformation = result[2] if len(result) > 2 else None
-            else:
-                out = result
-                occlusion_map = None
-                deformation = None
-
-            # Ensure we have all required outputs
-            if out is None:
-                raise ValueError("Warping network did not return valid output")
-
-            # Create dummy outputs if missing
-            bs = feature_3d.shape[0]
-            h, w = feature_3d.shape[-2:]
-
-            if occlusion_map is None:
-                occlusion_map = torch.ones(bs, 1, h, w, device=feature_3d.device, dtype=feature_3d.dtype)
-
-            if deformation is None:
-                d = feature_3d.shape[2]
-                deformation = torch.zeros(bs, d, h, w, 3, device=feature_3d.device, dtype=feature_3d.dtype)
-
-            return out, occlusion_map, deformation
-
-    # Create wrapper
-    wrapper = WarpingNetworkWrapper(model).to(device)
-    wrapper.eval()
-
-    # Create test inputs
-    feature_3d = torch.randn(1, 32, 16, 64, 64, device=device)
-    kp_driving = torch.randn(1, 21, 3, device=device)
-    kp_source = torch.randn(1, 21, 3, device=device)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    print("Exporting warping network with original grid_sample using opset 20...")
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (feature_3d, kp_driving, kp_source),
-            output_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['feature_3d', 'kp_driving', 'kp_source'],
-            output_names=['warped_feature', 'occlusion_map', 'deformation'],
-            dynamic_axes={
-                'feature_3d': {0: 'batch_size'},
-                'kp_driving': {0: 'batch_size'},
-                'kp_source': {0: 'batch_size'},
-                'warped_feature': {0: 'batch_size'},
-                'occlusion_map': {0: 'batch_size'},
-                'deformation': {0: 'batch_size'}
-            },
-            verbose=False,
-            training=torch.onnx.TrainingMode.EVAL
-        )
-
-    print(f"✓ Warping Network exported successfully using original grid_sample")
-    print(f"✓ Opset 20 provides native support for 5D operations")
-    print(f"✓ Ready for Unity/C# inference")
-
-    return wrapper
-
-
-def export_spade_generator_to_onnx(model, output_path: str, device='cpu', opset_version=20):
-    """Export SPADE Generator (G) to ONNX"""
-    print(f"Exporting SPADE Generator to {output_path}")
-
-    output_path = str(output_path)
-    device = torch.device('cpu')
-
-    class SPADEGeneratorWrapper(torch.nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
-
-        def forward(self, warped_feature):
-            return self.model(warped_feature)
-
-    wrapper = SPADEGeneratorWrapper(model).to(device)
-    wrapper.eval()
-
-    # Create dummy input: Bx256x64x64
-    dummy_input = torch.randn(1, 256, 64, 64, device=device)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            dummy_input,
-            output_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['warped_feature'],
-            output_names=['generated_image'],
-            dynamic_axes={
-                'warped_feature': {0: 'batch_size'},
-                'generated_image': {0: 'batch_size'}
-            },
-            verbose=False,
-            training=torch.onnx.TrainingMode.EVAL
-        )
-
-    print(f"✓ SPADE Generator exported successfully")
-    return wrapper
-
-
-def export_stitching_retargeting_to_onnx(model_dict, output_dir: str, device='cpu', opset_version=20):
-    """Export Stitching and Retargeting networks (S) to ONNX"""
-    print(f"Exporting Stitching/Retargeting Networks to {output_dir}")
-
-    device = torch.device('cpu')
-    os.makedirs(output_dir, exist_ok=True)
-
-    results = {}
-
-    for module_name, model in model_dict.items():
-        if model is None:
-            continue
-
-        output_path = os.path.join(output_dir, f"{module_name}.onnx")
-
-        class StitchingRetargetingWrapper(torch.nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.model = model
-
-            def forward(self, x):
-                return self.model(x)
-
-        wrapper = StitchingRetargetingWrapper(model).to(device)
-        wrapper.eval()
-
-        # Determine input size based on module type
-        if module_name == 'stitching':
-            input_size = 126  # (21*3)*2
-        elif module_name == 'lip':
-            input_size = 65   # (21*3)+2
-        elif module_name == 'eye':
-            input_size = 66   # (21*3)+3
-        else:
-            input_size = 126  # default
-
-        dummy_input = torch.randn(1, input_size, device=device)
-
-        with torch.no_grad():
-            torch.onnx.export(
-                wrapper,
-                dummy_input,
-                output_path,
-                export_params=True,
-                opset_version=opset_version,
-                do_constant_folding=True,
-                input_names=['input'],
-                output_names=['output'],
-                dynamic_axes={
-                    'input': {0: 'batch_size'},
-                    'output': {0: 'batch_size'}
-                },
-                verbose=False,
-                training=torch.onnx.TrainingMode.EVAL
-            )
-
-        results[module_name] = wrapper
-        print(f"✓ {module_name} network exported successfully")
-
-    return results
-
-
-def verify_onnx_model(model_path: str):
-    """Verify ONNX model can be loaded"""
     try:
-        import onnxruntime as ort
+        # Copy the model to output location
+        shutil.copy2(input_path, output_path)
 
-        # Test with ONNX Runtime
-        session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-        inputs = [input.name for input in session.get_inputs()]
-        outputs = [output.name for output in session.get_outputs()]
+        # Copy external data file if it exists
+        input_data = input_path + ".data"
+        if os.path.exists(input_data):
+            output_data = output_path + ".data"
+            shutil.copy2(input_data, output_data)
 
-        print(f"✓ ONNX model {os.path.basename(model_path)} verified successfully")
-        print(f"  Inputs: {inputs}")
-        print(f"  Outputs: {outputs}")
+        # Optimize the model
+        tune_model(output_path, model_type, fp16=False)
+
+        # Apply post-processing optimizations
+        model = onnx.load(output_path)
+        model_simp, check = simplify(model)
+
+        # Save original model as backup
+        shutil.copy(output_path, output_path + ".original")
+        onnx.save(model_simp, output_path)
+
+        print(f"✓ {model_name} processed successfully")
         return True
 
     except Exception as e:
-        print(f"✗ ONNX model {os.path.basename(model_path)} verification failed: {e}")
+        print(f"✗ Failed to process {model_name}: {e}")
         return False
 
+def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"):
+    """Convert FP32 ONNX model to FP16"""
+    try:
+        print(f"Converting {fp32_model_path} to FP16...")
 
-def convert_model_to_int8(fp32_model_path: str, int8_model_path: str, model_type: str = "general"):
-    """Convert FP32 ONNX model to INT8 quantized version"""
+        # Copy the FP32 model first
+        shutil.copy(fp32_model_path, fp16_model_path)
+
+        # Copy external data file if exists
+        fp32_data = fp32_model_path + ".data"
+        if os.path.exists(fp32_data):
+            fp16_data = fp16_model_path + ".data"
+            shutil.copy(fp32_data, fp16_data)
+
+        # Apply FP16 conversion using tune_model
+        tune_model(fp16_model_path, model_type, fp16=True)
+
+        # Apply post-processing optimizations
+        model = onnx.load(fp16_model_path)
+        model_simp, check = simplify(model)
+
+        # Save original model as backup
+        shutil.copy(fp16_model_path, fp16_model_path + ".original")
+        onnx.save(model_simp, fp16_model_path)
+
+        print(f"✓ FP16 model saved to {fp16_model_path}")
+        return True
+
+    except Exception as e:
+        print(f"✗ Failed to convert {fp32_model_path} to FP16: {e}")
+        return False
+
+def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type="general"):
+    """Convert FP32 ONNX model to INT8 using static quantization with QDQ format"""
     if not INT8_AVAILABLE:
-        print(f"Skipping INT8 conversion for {model_type} - quantization not available")
+        print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
         return False
 
     try:
-        print(f"Converting {model_type} to INT8...")
+        print(f"Converting {fp32_model_path} to INT8 using static QDQ quantization...")
+
+        from onnxruntime.quantization import quantize_static, CalibrationMethod, QuantFormat
+        from onnxruntime.quantization.calibrate import CalibrationDataReader
+
+        class DummyCalibrationDataReader(CalibrationDataReader):
+            def __init__(self, model_path):
+                self.model_path = model_path
+                self.data_generated = False
+
+                # Load model to get input shapes and types
+                model = onnx.load(model_path)
+                self.input_names = [inp.name for inp in model.graph.input]
+                self.input_shapes = {}
+                self.input_types = {}
+
+                for inp in model.graph.input:
+                    # Get shape
+                    shape = []
+                    for dim in inp.type.tensor_type.shape.dim:
+                        if dim.dim_value > 0:
+                            shape.append(dim.dim_value)
+                        else:
+                            # Use realistic defaults for dynamic dimensions
+                            shape.append(1)  # Default batch size
+
+                    self.input_shapes[inp.name] = shape
+
+                    # Get data type
+                    elem_type = inp.type.tensor_type.elem_type
+                    if elem_type == onnx.TensorProto.FLOAT:
+                        self.input_types[inp.name] = np.float32
+                    elif elem_type == onnx.TensorProto.INT64:
+                        self.input_types[inp.name] = np.int64
+                    elif elem_type == onnx.TensorProto.INT32:
+                        self.input_types[inp.name] = np.int32
+                    else:
+                        self.input_types[inp.name] = np.float32
+
+            def get_next(self):
+                if not self.data_generated:
+                    self.data_generated = True
+                    calibration_data = {}
+                    for name, shape in self.input_shapes.items():
+                        dtype = self.input_types[name]
+                        if dtype == np.int64 or dtype == np.int32:
+                            calibration_data[name] = np.zeros(shape, dtype=dtype)
+                        else:
+                            calibration_data[name] = np.random.randn(*shape).astype(dtype)
+                    return calibration_data
+                else:
+                    return None
+
+        calibration_reader = DummyCalibrationDataReader(fp32_model_path)
+
+        model_size = os.path.getsize(fp32_model_path)
+        use_external_data = model_size > 1024 * 1024 * 100  # > 100MB threshold
+
+        quantize_static(
+            model_input=fp32_model_path,
+            model_output=int8_model_path,
+            calibration_data_reader=calibration_reader,
+            quant_format=QuantFormat.QDQ,
+            weight_type=QuantType.QInt8,
+            activation_type=QuantType.QInt8,
+            use_external_data_format=use_external_data,
+            calibrate_method=CalibrationMethod.MinMax
+        )
+
+        print(f"✓ INT8 QDQ model saved to {int8_model_path}")
+        return True
+
+    except Exception as e:
+        print(f"✗ Failed to convert {fp32_model_path} to INT8 QDQ: {e}")
+        return False
+
+def convert_model_to_int8(fp32_model_path, int8_model_path, model_type="general"):
+    """Convert FP32 ONNX model to INT8"""
+    if not INT8_AVAILABLE:
+        print(f"Skipping INT8 conversion for {fp32_model_path} - onnxruntime quantization not available")
+        return False
+
+    try:
+        print(f"Converting {fp32_model_path} to INT8...")
+
+        # Try static QDQ quantization first
+        if convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type):
+            return True
+
+        print(f"Static QDQ quantization failed, trying dynamic quantization...")
+
+        # Fallback to dynamic quantization
+        model_size = os.path.getsize(fp32_model_path)
+        use_external_data = model_size > 1024 * 1024 * 100
 
         quantize_dynamic(
             model_input=fp32_model_path,
             model_output=int8_model_path,
             weight_type=QuantType.QInt8,
-            optimize_model=True
+            use_external_data_format=use_external_data
         )
 
-        print(f"✓ {model_type} INT8 conversion completed")
+        print(f"✓ INT8 model saved to {int8_model_path}")
         return True
 
     except Exception as e:
-        print(f"✗ {model_type} INT8 conversion failed: {e}")
+        print(f"✗ Failed to convert {fp32_model_path} to INT8: {e}")
         return False
 
+def verify_onnx_model(onnx_path, input_shapes=None):
+    """Verify the exported ONNX model"""
+    print(f"Verifying ONNX model: {onnx_path}")
 
-def export_model_with_quantization(export_func, model, output_path: str, model_name: str,
-                                   export_int8: bool = True, device: str = "cpu",
-                                   opset_version: int = 20, **kwargs):
-    """Export model with optional INT8 quantization"""
+    try:
+        # For large models with external data, skip protobuf check
+        file_size = os.path.getsize(onnx_path)
+        is_large_model = file_size > 100 * 1024 * 1024  # > 100MB
 
-    # Export FP32 model
-    fp32_path = output_path
-    wrapper = export_func(model, fp32_path, device, opset_version, **kwargs)
+        if not is_large_model:
+            onnx_model = onnx.load(onnx_path)
+            onnx.checker.check_model(onnx_model)
 
-    # Verify FP32 model
-    if not verify_onnx_model(fp32_path):
-        return None
+        # Create ONNX Runtime session to verify it can load
+        providers = ['CPUExecutionProvider']
+        if torch.cuda.is_available():
+            providers.insert(0, 'CUDAExecutionProvider')
 
-    # Export INT8 model if requested
-    if export_int8:
-        int8_path = fp32_path.replace('.onnx', '_int8.onnx')
-        convert_model_to_int8(fp32_path, int8_path, model_name)
+        session = ort.InferenceSession(onnx_path, providers=providers)
 
-        if os.path.exists(int8_path):
-            verify_onnx_model(int8_path)
+        print(f"✓ ONNX model {onnx_path} is valid")
+        print(f"  Input names: {[inp.name for inp in session.get_inputs()]}")
+        print(f"  Output names: {[out.name for out in session.get_outputs()]}")
 
-    return wrapper
+        return True
 
+    except Exception as e:
+        print(f"✗ ONNX model verification failed: {e}")
+        return False
+
+def cleanup_export_directory(output_dir):
+    """Clean up export directory, keeping only .onnx, .onnx.data, and config.json files"""
+    print(f"\n🧹 Cleaning up export directory: {output_dir}")
+
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return
+
+    kept_files = []
+    removed_files = []
+
+    for file_path in output_path.iterdir():
+        if file_path.is_file():
+            filename = file_path.name
+
+            # Keep these files
+            if (filename.endswith('.onnx') or
+                filename.endswith('.onnx.data') or
+                filename == 'onnx_config.json'):
+                kept_files.append(filename)
+            else:
+                # Remove everything else
+                try:
+                    file_path.unlink()
+                    removed_files.append(filename)
+                except Exception as e:
+                    print(f"⚠️ Failed to remove {filename}: {e}")
+
+    print(f"✓ Kept {len(kept_files)} essential files: {', '.join(kept_files)}")
+    if removed_files:
+        print(f"🗑️ Removed {len(removed_files)} temporary files")
+    else:
+        print("📝 No temporary files to remove")
+
+def process_model_with_precisions(input_path, base_path, model_name, model_type, export_fp32=True, export_fp16=False, export_int8=False):
+    """Process model in multiple precision formats"""
+    success_count = 0
+    base_path_str = str(base_path)
+
+    # Create precision-specific paths
+    fp32_path = base_path_str
+    fp16_path = base_path_str.replace('.onnx', '_fp16.onnx')
+    int8_path = base_path_str.replace('.onnx', '_int8.onnx')
+
+    # Process FP32 model first (base model)
+    if export_fp32 or export_fp16 or export_int8:
+        try:
+            print(f"\n=== Processing {model_name} (FP32) ===")
+            if process_existing_onnx_model(input_path, fp32_path, model_name, model_type):
+                if verify_onnx_model(fp32_path):
+                    if export_fp32:
+                        success_count += 1
+                        print(f"✓ {model_name} FP32 processing successful")
+
+                    # Convert to FP16 if requested
+                    if export_fp16:
+                        if convert_model_to_fp16(fp32_path, fp16_path, model_type):
+                            if verify_onnx_model(fp16_path):
+                                success_count += 1
+                                print(f"✓ {model_name} FP16 conversion successful")
+                            else:
+                                print(f"✗ {model_name} FP16 model verification failed")
+                        else:
+                            print(f"✗ {model_name} FP16 conversion failed")
+
+                    # Convert to INT8 if requested
+                    if export_int8:
+                        if convert_model_to_int8(fp32_path, int8_path, model_type):
+                            if verify_onnx_model(int8_path):
+                                success_count += 1
+                                print(f"✓ {model_name} INT8 quantization successful")
+                            else:
+                                print(f"✗ {model_name} INT8 model verification failed")
+                        else:
+                            print(f"✗ {model_name} INT8 quantization failed")
+
+                    # Remove FP32 if not requested (was only needed for conversion)
+                    if not export_fp32 and os.path.exists(fp32_path):
+                        os.remove(fp32_path)
+                        # Also remove external data file if exists
+                        fp32_data = fp32_path + ".data"
+                        if os.path.exists(fp32_data):
+                            os.remove(fp32_data)
+                else:
+                    print(f"✗ {model_name} FP32 model verification failed")
+            else:
+                print(f"✗ {model_name} FP32 processing failed")
+        except Exception as e:
+            print(f"✗ Failed to process {model_name}: {e}")
+
+    return success_count
 
 def main():
-    parser = argparse.ArgumentParser(description='Export LivePortrait models to ONNX')
-    parser.add_argument('--output_dir', type=str, default='./onnx_models',
-                       help='Output directory for ONNX models')
-    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'],
-                       help='Device for export (recommend CPU)')
-    parser.add_argument('--opset_version', type=int, default=20,
-                       help='ONNX opset version')
-    parser.add_argument('--export_int8', action='store_true',
-                       help='Also export INT8 quantized models')
-    parser.add_argument('--human_only', action='store_true',
-                       help='Export only human models (skip animal models)')
-    parser.add_argument('--verify_only', type=str, default=None,
-                       help='Only verify existing ONNX model at given path')
+    parser = argparse.ArgumentParser(description="Process LivePortrait ONNX models")
+    parser.add_argument("--weights_dir", default="./weights",
+                       help="Input directory containing ONNX models")
+    parser.add_argument("--output_dir", default="./models/onnx",
+                       help="Output directory for processed ONNX models")
+    parser.add_argument("--models", nargs="+",
+                       choices=["appearance_feature_extractor", "motion_extractor", "warping_spade", "landmark",
+                               "stitching", "stitching_eye", "stitching_lip", "det_10g", "2d106det", "all"],
+                       default=["all"], help="Models to process")
+    parser.add_argument("--precision", choices=["all", "fp32", "fp16", "floating", "int8"],
+                       default="floating", help="Precision to export: all (fp32+fp16+int8), fp32, fp16, floating (fp32+fp16), int8")
 
     args = parser.parse_args()
 
-    if args.verify_only:
-        verify_onnx_model(args.verify_only)
-        return
+    # Determine which precisions to export
+    export_fp32 = args.precision in ["all", "fp32", "floating"]
+    export_fp16 = args.precision in ["all", "fp16", "floating"]
+    export_int8 = args.precision in ["all", "int8"] and INT8_AVAILABLE
+
+    if args.precision in ["all", "int8"] and not INT8_AVAILABLE:
+        print("⚠️ INT8 quantization requested but onnxruntime quantization not available")
+        export_int8 = False
+
+    # Print precision configuration
+    precisions = []
+    if export_fp32: precisions.append("FP32")
+    if export_fp16: precisions.append("FP16")
+    if export_int8: precisions.append("INT8")
+    print(f"📝 Processing models in precision(s): {', '.join(precisions)}")
 
     # Create output directory
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize configurations
-    inference_cfg = InferenceConfig()
+    # Clean directory
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Load model configuration
-    with open(inference_cfg.models_config, 'r') as f:
-        model_config = yaml.safe_load(f)
-
-    print("Starting LivePortrait ONNX export...")
+    weights_dir = Path(args.weights_dir)
+    print(f"Loading models from: {weights_dir}")
     print(f"Output directory: {output_dir}")
-    print(f"Device: {args.device}")
-    print(f"ONNX Opset Version: {args.opset_version}")
-    print(f"Export INT8: {args.export_int8}")
 
-    device = args.device
-    opset_version = args.opset_version
+    # Define model mappings
+    model_mappings = {
+        "appearance_feature_extractor": {
+            "file": "appearance_feature_extractor.onnx",
+            "type": "encoder"
+        },
+        "motion_extractor": {
+            "file": "motion_extractor.onnx",
+            "type": "encoder"
+        },
+        "warping_spade": {
+            "file": "warping_spade.onnx",
+            "type": "spade"
+        },
+        "landmark": {
+            "file": "landmark.onnx",
+            "type": "landmark"
+        },
+        "stitching": {
+            "file": "stitching.onnx",
+            "type": "stitching"
+        },
+        "stitching_eye": {
+            "file": "stitching_eye.onnx",
+            "type": "stitching"
+        },
+        "stitching_lip": {
+            "file": "stitching_lip.onnx",
+            "type": "stitching"
+        },
+        "det_10g": {
+            "file": "det_10g_fixed.onnx",  # Use the fixed version
+            "type": "detector"
+        },
+        "2d106det": {
+            "file": "2d106det.onnx",
+            "type": "detector"
+        }
+    }
+
+    models_to_process = args.models
+    if "all" in models_to_process:
+        models_to_process = list(model_mappings.keys())
 
     try:
-        # Export Human Models
-        print("\n=== Exporting Human Models ===")
+        success_count = 0
 
-        # Load and export Appearance Feature Extractor (F)
-        print("\n1. Loading Appearance Feature Extractor...")
-        appearance_extractor = load_model(inference_cfg.checkpoint_F, model_config, device, 'appearance_feature_extractor')
-        export_model_with_quantization(
-            export_appearance_feature_extractor_to_onnx,
-            appearance_extractor,
-            str(output_dir / "appearance_feature_extractor.onnx"),
-            "Appearance Feature Extractor",
-            args.export_int8,
-            device,
-            opset_version
-        )
+        for model_name in models_to_process:
+            if model_name not in model_mappings:
+                print(f"⚠️ Unknown model: {model_name}")
+                continue
 
-        # Load and export Motion Extractor (M)
-        print("\n2. Loading Motion Extractor...")
-        motion_extractor = load_model(inference_cfg.checkpoint_M, model_config, device, 'motion_extractor')
-        export_model_with_quantization(
-            export_motion_extractor_to_onnx,
-            motion_extractor,
-            str(output_dir / "motion_extractor.onnx"),
-            "Motion Extractor",
-            args.export_int8,
-            device,
-            opset_version
-        )
+            model_info = model_mappings[model_name]
+            input_path = weights_dir / model_info["file"]
+            output_path = output_dir / f"{model_name}.onnx"
 
-        # Load and export Warping Network (W)
-        print("\n3. Loading Warping Network...")
-        warping_network = load_model(inference_cfg.checkpoint_W, model_config, device, 'warping_module')
-        export_model_with_quantization(
-            export_warping_network_to_onnx,
-            warping_network,
-            str(output_dir / "warping_network.onnx"),
-            "Warping Network",
-            args.export_int8,
-            device,
-            opset_version
-        )
+            if not input_path.exists():
+                print(f"⚠️ Model file not found: {input_path}")
+                continue
 
-        # Load and export SPADE Generator (G)
-        print("\n4. Loading SPADE Generator...")
-        spade_generator = load_model(inference_cfg.checkpoint_G, model_config, device, 'spade_generator')
-        export_model_with_quantization(
-            export_spade_generator_to_onnx,
-            spade_generator,
-            str(output_dir / "spade_generator.onnx"),
-            "SPADE Generator",
-            args.export_int8,
-            device,
-            opset_version
-        )
-
-        # Load and export Stitching/Retargeting Networks (S)
-        if os.path.exists(inference_cfg.checkpoint_S):
-            print("\n5. Loading Stitching/Retargeting Networks...")
-
-            stitching_model = load_model(inference_cfg.checkpoint_S, model_config, device, 'stitching_retargeting_module')
-
-            # Extract individual networks
-            stitching_dict = {}
-
-            # Handle case where model is a dict (which it is!)
-            if isinstance(stitching_model, dict):
-                for component_name in ['stitching', 'lip', 'eye']:
-                    if component_name in stitching_model:
-                        component = stitching_model[component_name]
-                        stitching_dict[component_name] = component
-            else:
-                # Handle case where model has attributes
-                for component_name in ['stitching', 'lip', 'eye']:
-                    if hasattr(stitching_model, component_name):
-                        component = getattr(stitching_model, component_name)
-                        stitching_dict[component_name] = component
-
-                # Check if it's a ModuleDict
-                if hasattr(stitching_model, '_modules'):
-                    for module_name, module in stitching_model._modules.items():
-                        if module_name in ['stitching', 'lip', 'eye']:
-                            stitching_dict[module_name] = module
-
-            if stitching_dict:
-                export_stitching_retargeting_to_onnx(
-                    stitching_dict,
-                    str(output_dir / "stitching"),
-                    device,
-                    opset_version
+            try:
+                success_count += process_model_with_precisions(
+                    input_path, output_path, model_name, model_info["type"],
+                    export_fp32, export_fp16, export_int8
                 )
-            else:
-                print("Warning: No stitching components found - skipping export")
+            except Exception as e:
+                print(f"Failed to process {model_name}: {e}")
 
-        # Export Animal Models (if requested)
-        if not args.human_only:
-            print("\n=== Exporting Animal Models ===")
-            animal_dir = output_dir / "animal"
-            animal_dir.mkdir(exist_ok=True)
+        print(f"\n✓ Successfully processed {success_count} model variants")
+        print(f"Output directory: {output_dir}")
 
-            # Check if animal model files exist before loading
-            if os.path.exists(inference_cfg.checkpoint_F_animal):
-                print("\n1. Loading Animal Appearance Feature Extractor...")
-                animal_appearance_extractor = load_model(inference_cfg.checkpoint_F_animal, model_config, device, 'appearance_feature_extractor')
-                export_model_with_quantization(
-                    export_appearance_feature_extractor_to_onnx,
-                    animal_appearance_extractor,
-                    str(animal_dir / "appearance_feature_extractor.onnx"),
-                    "Animal Appearance Feature Extractor",
-                    args.export_int8,
-                    device,
-                    opset_version
-                )
-
-            if os.path.exists(inference_cfg.checkpoint_M_animal):
-                print("\n2. Loading Animal Motion Extractor...")
-                animal_motion_extractor = load_model(inference_cfg.checkpoint_M_animal, model_config, device, 'motion_extractor')
-                export_model_with_quantization(
-                    export_motion_extractor_to_onnx,
-                    animal_motion_extractor,
-                    str(animal_dir / "motion_extractor.onnx"),
-                    "Animal Motion Extractor",
-                    args.export_int8,
-                    device,
-                    opset_version
-                )
-
-            if os.path.exists(inference_cfg.checkpoint_W_animal):
-                print("\n3. Loading Animal Warping Network...")
-                animal_warping_network = load_model(inference_cfg.checkpoint_W_animal, model_config, device, 'warping_module')
-                export_model_with_quantization(
-                    export_warping_network_to_onnx,
-                    animal_warping_network,
-                    str(animal_dir / "warping_network.onnx"),
-                    "Animal Warping Network",
-                    args.export_int8,
-                    device,
-                    opset_version
-                )
-
-            if os.path.exists(inference_cfg.checkpoint_G_animal):
-                print("\n4. Loading Animal SPADE Generator...")
-                animal_spade_generator = load_model(inference_cfg.checkpoint_G_animal, model_config, device, 'spade_generator')
-                export_model_with_quantization(
-                    export_spade_generator_to_onnx,
-                    animal_spade_generator,
-                    str(animal_dir / "spade_generator.onnx"),
-                    "Animal SPADE Generator",
-                    args.export_int8,
-                    device,
-                    opset_version
-                )
-
-        # Create metadata file
-        metadata = {
-            'export_info': {
-                'device': args.device,
-                'opset_version': args.opset_version,
-                'int8_exported': args.export_int8,
-                'human_only': args.human_only
+        # Save configuration
+        config = {
+            "source_weights_dir": str(weights_dir),
+            "processed_models": models_to_process,
+            "precision": args.precision,
+            "precisions_processed": {
+                "fp32": export_fp32,
+                "fp16": export_fp16,
+                "int8": export_int8
             },
-            'model_info': {
-                'appearance_feature_extractor': {
-                    'input_shape': [1, 3, 256, 256],
-                    'output_shape': [1, 32, 16, 64, 64],
-                    'description': 'Extracts 3D appearance features from source image'
-                },
-                'motion_extractor': {
-                    'input_shape': [1, 3, 256, 256],
-                    'output_shapes': {
-                        'pitch': [1, 1], 'yaw': [1, 1], 'roll': [1, 1],
-                        't': [1, 3], 'exp': [1, 63], 'scale': [1, 1], 'kp': [1, 63]
-                    },
-                    'description': 'Extracts keypoints, pose, and expression from image'
-                },
-                'warping_network': {
-                    'input_shapes': {
-                        'feature_3d': [1, 32, 16, 64, 64],
-                        'kp_driving': [1, 21, 3],
-                        'kp_source': [1, 21, 3]
-                    },
-                    'output_shapes': {
-                        'warped_feature': [1, 256, 64, 64],
-                        'occlusion_map': [1, 1, 64, 64],
-                        'deformation': [1, 16, 64, 64, 3]
-                    },
-                    'description': 'Warps source features using motion information'
-                },
-                'spade_generator': {
-                    'input_shape': [1, 256, 64, 64],
-                    'output_shape': [1, 3, 256, 256],
-                    'description': 'Generates final animated image'
-                }
-            }
+            "int8_available": INT8_AVAILABLE,
+            "success_count": success_count,
+            "model_mappings": model_mappings
         }
 
-        with open(output_dir / "export_metadata.json", 'w') as f:
-            json.dump(metadata, f, indent=2)
+        config_path = output_dir / "onnx_config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
 
-        print(f"\n✅ LivePortrait ONNX export completed successfully!")
-        print(f"📁 Models exported to: {output_dir}")
-        print(f"📄 Metadata saved to: {output_dir}/export_metadata.json")
+        print(f"Configuration saved to: {config_path}")
 
-        # Note about InsightFace models
-        print(f"\n📝 Note: InsightFace models are already in ONNX format at:")
-        print(f"   Check pretrained_weights/insightface/ for face detection models")
+        # Clean up temporary files
+        cleanup_export_directory(output_dir)
 
     except Exception as e:
-        print(f"\n❌ Export failed: {e}")
+        print(f"Error during processing: {e}")
         import traceback
         traceback.print_exc()
+        return 1
 
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())

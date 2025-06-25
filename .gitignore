@@ -30,6 +30,9 @@ ffmpeg/
 LivePortrait_env/
 onnx_models/
 unity_example/
+onnxruntime_profile_*.json
+models/onnx
+dump
 
 # XPose build files
 src/utils/dependencies/XPose/models/UniPose/ops/build

@@ -247,7 +247,7 @@ def crop_src_image(models, img):
 
     # crop the face
     crop_info = crop_image(img, lmk, dsize=512, scale=2.3, vy_ratio=-0.125)
-    cv2.imwrite("crop_info0.png", crop_info["img_crop"])
+    # cv2.imwrite("crop_info0.png", crop_info["img_crop"])
     print(f"[DEBUG_CROP_SRC] Crop info keys: {list(crop_info.keys())}")
 
     lmk = landmark_runner(models, img, lmk)
@@ -619,7 +619,7 @@ class LivePortraitWrapper():
         src_img = src_preprocess(img)
         crop_info = crop_src_image(self.models, src_img)
 
-        cv2.imwrite("crop_info.png", crop_info["img_crop_256x256"])
+        # cv2.imwrite("crop_info.png", crop_info["img_crop_256x256"])
 
         # prepare_source
         img_crop_256x256 = crop_info["img_crop_256x256"]
