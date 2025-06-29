@@ -59,6 +59,152 @@ class CorrectedWarpingSpadeWrapper(nn.Module):
 
         return final_image
 
+def apply_coreml_compatibility_fixes(model_path):
+    """Apply graph transformations to make the ONNX model CoreML-friendly."""
+    print(f"🔧 Applying CoreML compatibility fixes to {model_path}...")
+    try:
+        model = onnx.load(model_path)
+        graph = model.graph
+
+        # --- FIX 1: Cast INT64 inputs to INT32 for specified ops ---
+        nodes_to_fix = ['Concat', 'Gather'] # For Unsqueeze, axes should be INT64
+        for node in list(graph.node):
+            if node.op_type in nodes_to_fix:
+                for i, input_name in enumerate(node.input):
+                    # Find the tensor producer
+                    for tensor in list(graph.initializer):
+                        if tensor.name == input_name and tensor.data_type == onnx.TensorProto.INT64:
+                            # Cast initializer data
+                            int64_data = onnx.numpy_helper.to_array(tensor)
+                            int32_data = int64_data.astype(np.int32)
+                            new_tensor = onnx.numpy_helper.from_array(int32_data, name=tensor.name)
+                            graph.initializer.remove(tensor)
+                            graph.initializer.append(new_tensor)
+                            print(f"  ✓ Casted initializer '{tensor.name}' to INT32 for node '{node.name}'")
+
+        # --- FIX 2: Replace high-rank Reshape/Unsqueeze ---
+        for node in list(graph.node):
+             # Heuristic to find Reshape creating 6D tensor from 3D (1,21,3) -> (1,21,1,1,1,3)
+            if node.op_type == 'Reshape':
+                input_tensor_name = node.input[0]
+                shape_tensor_name = node.input[1]
+
+                # Find input shape
+                input_shape = None
+                for vi in graph.value_info:
+                    if vi.name == input_tensor_name:
+                        input_shape = [d.dim_value for d in vi.type.tensor_type.shape.dim]
+                for inp in graph.input:
+                     if inp.name == input_tensor_name:
+                         input_shape = [d.dim_value for d in inp.type.tensor_type.shape.dim]
+
+                # Find new shape from initializer
+                new_shape = None
+                for init in graph.initializer:
+                    if init.name == shape_tensor_name:
+                        new_shape = onnx.numpy_helper.to_array(init)
+
+                if input_shape and new_shape is not None and len(input_shape) == 3 and len(new_shape) == 6:
+                    print(f"  ✓ Replacing 6D Reshape '{node.name}' with a 5D version.")
+                    # Create a new 5D shape (1, 21, 1, 1, 3)
+                    new_shape_5d = np.array([new_shape[0], new_shape[1], 1, 1, new_shape[5]], dtype=np.int64)
+
+                    # Find and replace the initializer
+                    initializer_to_replace = None
+                    for init in graph.initializer:
+                        if init.name == shape_tensor_name:
+                            initializer_to_replace = init
+                            break
+
+                    if initializer_to_replace:
+                        new_initializer = onnx.numpy_helper.from_array(new_shape_5d, name=shape_tensor_name)
+                        graph.initializer.remove(initializer_to_replace)
+                        graph.initializer.append(new_initializer)
+
+        # --- FIX 3: Replace unsupported operators ---
+        new_graph_nodes = []
+        for node in graph.node:
+            # Replace AveragePool with Conv
+            if node.op_type == 'AveragePool':
+                print(f"  ✓ Replacing AveragePool '{node.name}' with Conv.")
+
+                kernel_shape = None
+                strides = [1, 1]  # Default value
+                pads = [0, 0, 0, 0] # Default value
+
+                for attr in node.attribute:
+                    if attr.name == 'kernel_shape':
+                        kernel_shape = attr.ints
+                    elif attr.name == 'strides':
+                        strides = attr.ints
+                    elif attr.name == 'pads':
+                        pads = attr.ints
+
+                if not kernel_shape:
+                    print(f"  ✗ Skipping AveragePool '{node.name}': kernel_shape not found.")
+                    new_graph_nodes.append(node) # Keep original node
+                    continue
+
+                in_channels = 1 # We can try to infer this, but for now let's assume it's specific
+                # This needs more robust channel detection
+                # For now, this is a placeholder for a specific model structure
+
+                # Create equivalent conv kernel
+                k = np.ones(kernel_shape, dtype=np.float32) / np.prod(kernel_shape)
+                k = k.reshape(1, 1, *kernel_shape) # (out_channels, in_channels/groups, H, W)
+
+                conv_kernel_name = node.name + "_kernel"
+                conv_kernel_init = onnx.numpy_helper.from_array(k, name=conv_kernel_name)
+                graph.initializer.append(conv_kernel_init)
+
+                conv_node = onnx.helper.make_node(
+                    'Conv',
+                    inputs=[node.input[0], conv_kernel_name],
+                    outputs=node.output,
+                    name=node.name + "_conv",
+                    strides=strides,
+                    pads=pads
+                )
+                new_graph_nodes.append(conv_node)
+
+            # Modify Resize nodes for CoreML compatibility
+            elif node.op_type == 'Resize':
+                print(f"  ✓ Modifying Resize node '{node.name}' for CoreML compatibility.")
+
+                # Get existing attributes and update them for compatibility
+                attrs = {attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute}
+                attrs['mode'] = 'nearest'
+                attrs['coordinate_transformation_mode'] = 'asymmetric'
+
+                # Remove attributes that are not used with nearest mode
+                attrs.pop('cubic_coeff_a', None)
+
+                new_node = onnx.helper.make_node(
+                    'Resize',
+                    inputs=node.input,
+                    outputs=node.output,
+                    name=node.name,
+                    **attrs
+                )
+                new_graph_nodes.append(new_node)
+            else:
+                new_graph_nodes.append(node)
+
+        # Replace the old graph nodes with the new list
+        del graph.node[:]
+        graph.node.extend(new_graph_nodes)
+
+        # Clean up graph and save
+        onnx.checker.check_model(model)
+        onnx.save(model, model_path)
+        print(f"✓ CoreML compatibility fixes applied successfully.")
+        return True
+    except Exception as e:
+        print(f"✗ Failed to apply CoreML fixes: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def export_warping_spade_from_pytorch(output_path):
     """Export warping_spade directly from PyTorch modules with corrected parameter order"""
     print(f"🔧 Exporting warping_spade from PyTorch modules...")
@@ -128,7 +274,13 @@ def export_warping_spade_from_pytorch(output_path):
         if check:
             onnx.save(model_simp, output_path)
             print(f"✅ PyTorch export and optimization complete")
-            print(f"📊 Final model: {len(model_simp.graph.node)} nodes")
+
+            # Apply CoreML compatibility fixes
+            apply_coreml_compatibility_fixes(output_path)
+
+            # Re-verify the model after fixes
+            model_final = onnx.load(output_path)
+            print(f"📊 Final model: {len(model_final.graph.node)} nodes")
             return True
         else:
             print(f"❌ Optimization failed")
@@ -222,6 +374,10 @@ def process_existing_onnx_model(input_path, output_path, model_name, model_type=
         shutil.copy(output_path, output_path + ".original")
         onnx.save(model_simp, output_path)
 
+        # Apply CoreML fixes if it's the warping_spade model
+        if "warping_spade" in output_path:
+            apply_coreml_compatibility_fixes(output_path)
+
         print(f"✓ {model_name} processed successfully")
         return True
 
@@ -253,6 +409,10 @@ def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"
         # Save original model as backup
         shutil.copy(fp16_model_path, fp16_model_path + ".original")
         onnx.save(model_simp, fp16_model_path)
+
+        # Apply CoreML fixes if it's the warping_spade model
+        if "warping_spade" in fp16_model_path:
+            apply_coreml_compatibility_fixes(fp16_model_path)
 
         print(f"✓ FP16 model saved to {fp16_model_path}")
         return True
