@@ -2,10 +2,12 @@
 """
 ONNX Export and Processing Script for LivePortrait Models
 This script loads existing ONNX models, optimizes them, and converts to different precisions.
+Added support for exporting warping_spade directly from PyTorch modules.
 """
 
 import os
 import torch
+import torch.nn as nn
 import onnx
 import onnxruntime as ort
 import numpy as np
@@ -14,6 +16,10 @@ import json
 from pathlib import Path
 import shutil
 from onnxsim import simplify
+import sys
+
+# Add src path for PyTorch export
+sys.path.append('src')
 
 # INT8 quantization support
 try:
@@ -29,6 +35,110 @@ except ImportError:
 from onnxruntime.transformers.float16 import convert_float_to_float16
 from onnxruntime.transformers.fusion_options import FusionOptions
 from onnxruntime.transformers.optimizer import optimize_model
+
+class CorrectedWarpingSpadeWrapper(nn.Module):
+    """
+    Corrected wrapper for warping_spade export from PyTorch
+    Uses correct input order: (feature_3d, kp_driving, kp_source)
+    """
+
+    def __init__(self, warping_module, spade_generator):
+        super().__init__()
+        self.warping_module = warping_module
+        self.spade_generator = spade_generator
+
+    def forward(self, feature_3d, kp_driving, kp_source):
+        """
+        Correct parameter order matching original warping_spade.onnx
+        """
+        # Call warping module with correct parameter mapping
+        ret_dct = self.warping_module(feature_3d, kp_source=kp_source, kp_driving=kp_driving)
+
+        # SPADE decode
+        final_image = self.spade_generator(feature=ret_dct['out'])
+
+        return final_image
+
+def export_warping_spade_from_pytorch(output_path):
+    """Export warping_spade directly from PyTorch modules with corrected parameter order"""
+    print(f"🔧 Exporting warping_spade from PyTorch modules...")
+
+    try:
+        from src.config.inference_config import InferenceConfig
+        from src.live_portrait_wrapper import LivePortraitWrapper
+
+        # Load PyTorch modules
+        cfg = InferenceConfig()
+        cfg.flag_force_cpu = True
+        wrapper = LivePortraitWrapper(inference_cfg=cfg)
+
+        print("✅ PyTorch modules loaded")
+
+        # Create corrected wrapper
+        pytorch_wrapper = CorrectedWarpingSpadeWrapper(
+            warping_module=wrapper.warping_module,
+            spade_generator=wrapper.spade_generator
+        )
+
+        pytorch_wrapper.eval()
+
+        # Fixed input shapes for maximum optimization
+        with torch.no_grad():
+            feature_3d = torch.randn(1, 32, 16, 64, 64)
+            kp_driving = torch.randn(1, 21, 3)  # Correct order
+            kp_source = torch.randn(1, 21, 3)
+
+            # Test
+            test_output = pytorch_wrapper(feature_3d, kp_driving, kp_source)
+            print(f"✅ Test output shape: {test_output.shape}")
+
+        # Export to ONNX with corrected parameter order
+        sample_inputs = (feature_3d, kp_driving, kp_source)
+
+        torch.onnx.export(
+            pytorch_wrapper,
+            sample_inputs,
+            output_path,
+            export_params=True,
+            opset_version=20,
+            do_constant_folding=True,
+            input_names=['feature_3d', 'kp_driving', 'kp_source'],  # Corrected order
+            output_names=['out'],
+            # Fixed shapes for maximum optimization - no dynamic axes
+        )
+
+        print(f"✅ PyTorch export successful")
+
+        # Optimize the exported model
+        model = onnx.load(output_path)
+        onnx.checker.check_model(model)
+
+        print(f"🔧 Optimizing exported model...")
+        model_simp, check = simplify(
+            model,
+            check_n=5,
+            perform_optimization=True,
+            overwrite_input_shapes={
+                'feature_3d': [1, 32, 16, 64, 64],
+                'kp_driving': [1, 21, 3],
+                'kp_source': [1, 21, 3]
+            }
+        )
+
+        if check:
+            onnx.save(model_simp, output_path)
+            print(f"✅ PyTorch export and optimization complete")
+            print(f"📊 Final model: {len(model_simp.graph.node)} nodes")
+            return True
+        else:
+            print(f"❌ Optimization failed")
+            return False
+
+    except Exception as e:
+        print(f"❌ PyTorch export failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 @torch.no_grad()
 def tune_model(
@@ -331,7 +441,7 @@ def cleanup_export_directory(output_dir):
     else:
         print("📝 No temporary files to remove")
 
-def process_model_with_precisions(input_path, base_path, model_name, model_type, export_fp32=True, export_fp16=False, export_int8=False):
+def process_model_with_precisions(input_path, base_path, model_name, model_type, export_fp32=True, export_fp16=False, export_int8=False, from_pytorch=False):
     """Process model in multiple precision formats"""
     success_count = 0
     base_path_str = str(base_path)
@@ -345,45 +455,57 @@ def process_model_with_precisions(input_path, base_path, model_name, model_type,
     if export_fp32 or export_fp16 or export_int8:
         try:
             print(f"\n=== Processing {model_name} (FP32) ===")
-            if process_existing_onnx_model(input_path, fp32_path, model_name, model_type):
-                if verify_onnx_model(fp32_path):
-                    if export_fp32:
-                        success_count += 1
-                        print(f"✓ {model_name} FP32 processing successful")
 
-                    # Convert to FP16 if requested
-                    if export_fp16:
-                        if convert_model_to_fp16(fp32_path, fp16_path, model_type):
-                            if verify_onnx_model(fp16_path):
-                                success_count += 1
-                                print(f"✓ {model_name} FP16 conversion successful")
-                            else:
-                                print(f"✗ {model_name} FP16 model verification failed")
-                        else:
-                            print(f"✗ {model_name} FP16 conversion failed")
-
-                    # Convert to INT8 if requested
-                    if export_int8:
-                        if convert_model_to_int8(fp32_path, int8_path, model_type):
-                            if verify_onnx_model(int8_path):
-                                success_count += 1
-                                print(f"✓ {model_name} INT8 quantization successful")
-                            else:
-                                print(f"✗ {model_name} INT8 model verification failed")
-                        else:
-                            print(f"✗ {model_name} INT8 quantization failed")
-
-                    # Remove FP32 if not requested (was only needed for conversion)
-                    if not export_fp32 and os.path.exists(fp32_path):
-                        os.remove(fp32_path)
-                        # Also remove external data file if exists
-                        fp32_data = fp32_path + ".data"
-                        if os.path.exists(fp32_data):
-                            os.remove(fp32_data)
+            # Check if we should export from PyTorch
+            if from_pytorch and model_name == "warping_spade":
+                print(f"🔧 Exporting {model_name} from PyTorch modules...")
+                if export_warping_spade_from_pytorch(fp32_path):
+                    print(f"✅ PyTorch export successful")
                 else:
-                    print(f"✗ {model_name} FP32 model verification failed")
+                    print(f"❌ PyTorch export failed")
+                    return 0
             else:
-                print(f"✗ {model_name} FP32 processing failed")
+                # Use existing ONNX processing
+                if not process_existing_onnx_model(input_path, fp32_path, model_name, model_type):
+                    print(f"✗ {model_name} FP32 processing failed")
+                    return 0
+
+            if verify_onnx_model(fp32_path):
+                if export_fp32:
+                    success_count += 1
+                    print(f"✓ {model_name} FP32 processing successful")
+
+                # Convert to FP16 if requested
+                if export_fp16:
+                    if convert_model_to_fp16(fp32_path, fp16_path, model_type):
+                        if verify_onnx_model(fp16_path):
+                            success_count += 1
+                            print(f"✓ {model_name} FP16 conversion successful")
+                        else:
+                            print(f"✗ {model_name} FP16 model verification failed")
+                    else:
+                        print(f"✗ {model_name} FP16 conversion failed")
+
+                # Convert to INT8 if requested
+                if export_int8:
+                    if convert_model_to_int8(fp32_path, int8_path, model_type):
+                        if verify_onnx_model(int8_path):
+                            success_count += 1
+                            print(f"✓ {model_name} INT8 quantization successful")
+                        else:
+                            print(f"✗ {model_name} INT8 model verification failed")
+                    else:
+                        print(f"✗ {model_name} INT8 quantization failed")
+
+                # Remove FP32 if not requested (was only needed for conversion)
+                if not export_fp32 and os.path.exists(fp32_path):
+                    os.remove(fp32_path)
+                    # Also remove external data file if exists
+                    fp32_data = fp32_path + ".data"
+                    if os.path.exists(fp32_data):
+                        os.remove(fp32_data)
+            else:
+                print(f"✗ {model_name} FP32 model verification failed")
         except Exception as e:
             print(f"✗ Failed to process {model_name}: {e}")
 
@@ -401,6 +523,8 @@ def main():
                        default=["all"], help="Models to process")
     parser.add_argument("--precision", choices=["all", "fp32", "fp16", "floating", "int8"],
                        default="floating", help="Precision to export: all (fp32+fp16+int8), fp32, fp16, floating (fp32+fp16), int8")
+    parser.add_argument("--from-pytorch", action="store_true",
+                       help="Export warping_spade from PyTorch modules instead of existing ONNX (corrects parameter order)")
 
     args = parser.parse_args()
 
@@ -419,6 +543,10 @@ def main():
     if export_fp16: precisions.append("FP16")
     if export_int8: precisions.append("INT8")
     print(f"📝 Processing models in precision(s): {', '.join(precisions)}")
+
+    # Print PyTorch export info
+    if getattr(args, 'from_pytorch', False):
+        print(f"🔧 PyTorch export enabled for warping_spade (corrected parameter order)")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -488,14 +616,17 @@ def main():
             input_path = weights_dir / model_info["file"]
             output_path = output_dir / f"{model_name}.onnx"
 
-            if not input_path.exists():
+            # For PyTorch export, we don't need the input file to exist
+            if getattr(args, 'from_pytorch', False) and model_name == "warping_spade":
+                print(f"🔧 Will export {model_name} from PyTorch modules")
+            elif not input_path.exists():
                 print(f"⚠️ Model file not found: {input_path}")
                 continue
 
             try:
                 success_count += process_model_with_precisions(
                     input_path, output_path, model_name, model_info["type"],
-                    export_fp32, export_fp16, export_int8
+                    export_fp32, export_fp16, export_int8, from_pytorch=getattr(args, 'from_pytorch', False)
                 )
             except Exception as e:
                 print(f"Failed to process {model_name}: {e}")
@@ -508,6 +639,7 @@ def main():
             "source_weights_dir": str(weights_dir),
             "processed_models": models_to_process,
             "precision": args.precision,
+            "from_pytorch": getattr(args, 'from_pytorch', False),
             "precisions_processed": {
                 "fp32": export_fp32,
                 "fp16": export_fp16,
