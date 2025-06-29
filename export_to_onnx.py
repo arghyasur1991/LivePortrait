@@ -145,13 +145,41 @@ def apply_coreml_compatibility_fixes(model_path):
                     new_graph_nodes.append(node) # Keep original node
                     continue
 
-                in_channels = 1 # We can try to infer this, but for now let's assume it's specific
-                # This needs more robust channel detection
-                # For now, this is a placeholder for a specific model structure
+                # --- Correctly infer channels for grouped convolution ---
+                input_tensor_name = node.input[0]
+                channels = None
 
-                # Create equivalent conv kernel
-                k = np.ones(kernel_shape, dtype=np.float32) / np.prod(kernel_shape)
-                k = k.reshape(1, 1, *kernel_shape) # (out_channels, in_channels/groups, H, W)
+                # Manually run shape inference to populate value_info
+                try:
+                    model = onnx.shape_inference.infer_shapes(model)
+                    graph = model.graph
+                    print("  - Ran shape inference to ensure all tensor shapes are available.")
+                except Exception as e:
+                    print(f"  - Warning: Shape inference failed: {e}")
+
+                for vi in list(graph.value_info) + list(graph.input) + list(graph.initializer):
+                    if vi.name == input_tensor_name:
+                        if isinstance(vi, onnx.TensorProto): # Initializer
+                             if len(vi.dims) > 1:
+                                channels = vi.dims[1]
+                                break
+                        elif vi.type.tensor_type.shape: # ValueInfo or Input
+                            shape = vi.type.tensor_type.shape.dim
+                            if len(shape) > 1 and shape[1].dim_value > 0:
+                                channels = shape[1].dim_value
+                                break
+
+                if not channels:
+                     print(f"  ✗ Skipping AveragePool '{node.name}': could not infer input channels.")
+                     new_graph_nodes.append(node)
+                     continue
+
+                print(f"  - Inferred {channels} channels for grouped convolution.")
+
+                # Create equivalent conv kernel for grouped convolution
+                k = np.zeros((channels, 1, *kernel_shape), dtype=np.float32)
+                for i in range(channels):
+                    k[i, 0, ...] = 1.0 / np.prod(kernel_shape)
 
                 conv_kernel_name = node.name + "_kernel"
                 conv_kernel_init = onnx.numpy_helper.from_array(k, name=conv_kernel_name)
@@ -163,7 +191,8 @@ def apply_coreml_compatibility_fixes(model_path):
                     outputs=node.output,
                     name=node.name + "_conv",
                     strides=strides,
-                    pads=pads
+                    pads=pads,
+                    group=channels # Apply kernel to each channel independently
                 )
                 new_graph_nodes.append(conv_node)
 
