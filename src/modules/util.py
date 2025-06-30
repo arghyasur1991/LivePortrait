@@ -33,11 +33,11 @@ def kp2gaussian(kp, spatial_size, kp_variance):
 
     # Process all keypoints for all batches simultaneously but within 5D constraint
     # Reshape mean to (bs*num_kp, 3) and coordinate_grid to (bs*num_kp, d, h, w, 3)
-    mean_flat = mean.view(bs * num_kp, 3)  # (bs*num_kp, 3) - 2D
+    mean_flat = mean.reshape(bs * num_kp, 3)  # (bs*num_kp, 3) - 2D
     coordinate_grid_expanded = coordinate_grid.repeat(bs * num_kp, 1, 1, 1, 1)  # (bs*num_kp, d, h, w, 3) - 5D
 
     # Reshape mean for broadcasting: (bs*num_kp, 3) -> (bs*num_kp, 1, 1, 1, 3) - 5D
-    mean_expanded = mean_flat.view(bs * num_kp, 1, 1, 1, 3)  # (bs*num_kp, 1, 1, 1, 3) - 5D
+    mean_expanded = mean_flat.reshape(bs * num_kp, 1, 1, 1, 3)  # (bs*num_kp, 1, 1, 1, 3) - 5D
 
     # Calculate mean_sub: (bs*num_kp, d, h, w, 3) - 5D
     mean_sub = coordinate_grid_expanded - mean_expanded
@@ -46,7 +46,7 @@ def kp2gaussian(kp, spatial_size, kp_variance):
     out_flat = torch.exp(-0.5 * (mean_sub ** 2).sum(-1) / kp_variance)
 
     # Reshape back to (bs, num_kp, d, h, w) - 5D
-    out = out_flat.view(bs, num_kp, d, h, w)
+    out = out_flat.reshape(bs, num_kp, d, h, w)
 
     return out
 
@@ -175,14 +175,14 @@ class DownBlock3d(nn.Module):
 
         # Reshape to 4D for 2D pooling: (bs, c, d, h, w) -> (bs*d, c, h, w)
         bs, c, d, h, w = out.shape
-        out_reshaped = out.view(bs * d, c, h, w)  # (bs*d, c, h, w) - 4D
+        out_reshaped = out.reshape(bs * d, c, h, w)  # (bs*d, c, h, w) - 4D
 
         # Apply 2D pooling: (bs*d, c, h, w) -> (bs*d, c, h//2, w//2) - 4D
         out_pooled = self.pool(out_reshaped)
 
         # Reshape back to 5D: (bs*d, c, h//2, w//2) -> (bs, c, d, h//2, w//2)
         _, _, h_new, w_new = out_pooled.shape
-        out = out_pooled.view(bs, c, d, h_new, w_new)  # (bs, c, d, h//2, w//2) - 5D
+        out = out_pooled.reshape(bs, c, d, h_new, w_new)  # (bs, c, d, h//2, w//2) - 5D
 
         return out
 
@@ -412,11 +412,10 @@ to_2tuple = _ntuple(2)
 
 class Conv3DEquivalent(nn.Module):
     """
-    Mathematically equivalent replacement for Conv3d using multiple Conv2d operations.
+    Optimized mathematically equivalent replacement for Conv3d.
 
-    This exactly replicates 3D convolution behavior:
-    For each depth offset in the 3D kernel, apply the corresponding 2D kernel slice
-    to the depth-shifted input, then sum all contributions.
+    Uses efficient vectorized operations instead of multiple Conv2d layers
+    to dramatically reduce graph size while maintaining exact equivalence.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
@@ -438,55 +437,62 @@ class Conv3DEquivalent(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        # Create 2D conv layers for each depth slice of the 3D kernel
-        self.conv2d_layers = nn.ModuleList()
-        for dd in range(self.kd):
-            conv2d = nn.Conv2d(in_channels, out_channels, (self.kh, self.kw),
-                              padding=(self.ph, self.pw), stride=stride, bias=False)
-            self.conv2d_layers.append(conv2d)
+        # Single optimized Conv2d layer instead of multiple layers
+        # Process all depth slices in parallel using channel dimension
+        self.conv2d = nn.Conv2d(
+            in_channels * self.kd,
+            out_channels,
+            (self.kh, self.kw),
+            padding=(self.ph, self.pw),
+            stride=stride,
+            bias=bias
+        )
 
-        # Bias parameter (shared across all depth slices)
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_channels))
-        else:
-            self.register_parameter('bias', None)
+        # Store kernel depth for weight loading
+        self.kernel_depth = self.kd
 
     def forward(self, x):
         # Input: (bs, c_in, d, h, w)
         bs, c_in, d, h, w = x.shape
 
-        # Initialize output
-        output = torch.zeros(bs, self.out_channels, d, h, w, device=x.device, dtype=x.dtype)
+        # Pad depth dimension if needed
+        if self.pd > 0:
+            x = F.pad(x, (0, 0, 0, 0, self.pd, self.pd), mode='constant', value=0)
+            d = d + 2 * self.pd
 
-        # For each depth offset in the 3D kernel
-        for dd, conv2d in enumerate(self.conv2d_layers):
-            depth_offset = dd - self.kd // 2
+        # Prepare input for vectorized convolution
+        # Create sliding window over depth dimension
+        input_slices = []
+        for d_out in range(d - self.kd + 1):
+            # Extract depth window: (bs, c_in, kd, h, w)
+            depth_window = x[:, :, d_out:d_out+self.kd, :, :]
+            # Reshape to (bs, c_in*kd, h, w)
+            depth_window_flat = depth_window.reshape(bs, c_in * self.kd, h, w)
+            input_slices.append(depth_window_flat)
 
-            # Handle depth boundaries with padding
-            for d_out in range(d):
-                d_in = d_out + depth_offset
+        if not input_slices:
+            # Handle edge case where output depth would be 0
+            return torch.zeros(bs, self.out_channels, 0, h, w, device=x.device, dtype=x.dtype)
 
-                # Check if input depth is valid (within padding bounds)
-                if -self.pd <= d_in < d + self.pd:
-                    if 0 <= d_in < d:
-                        # Valid input depth - use actual input
-                        input_slice = x[:, :, d_in, :, :]  # (bs, c_in, h, w)
-                        output_slice = conv2d(input_slice)  # (bs, c_out, h, w)
-                        output[:, :, d_out, :, :] += output_slice
-                    elif self.pd > 0:
-                        # Handle depth padding (typically zero padding)
-                        # For simplicity, we'll skip padded regions (equivalent to zero padding)
-                        pass
+        # Stack all depth positions: (bs, d_out, c_in*kd, h, w)
+        input_stacked = torch.stack(input_slices, dim=1)
+        bs, d_out, c_flat, h, w = input_stacked.shape
 
-        # Add bias if present
-        if self.bias is not None:
-            output += self.bias.view(1, -1, 1, 1, 1)
+        # Reshape for batch processing: (bs*d_out, c_in*kd, h, w)
+        input_batch = input_stacked.reshape(bs * d_out, c_flat, h, w)
+
+        # Single vectorized convolution
+        output_batch = self.conv2d(input_batch)  # (bs*d_out, c_out, h_out, w_out)
+
+        # Reshape back to 5D: (bs, d_out, c_out, h_out, w_out) -> (bs, c_out, d_out, h_out, w_out)
+        bs_d_out, c_out, h_out, w_out = output_batch.shape
+        output = output_batch.reshape(bs, d_out, c_out, h_out, w_out).permute(0, 2, 1, 3, 4)
 
         return output
 
     def load_conv3d_weights(self, conv3d_weight, conv3d_bias=None):
         """
-        Load weights from a Conv3d layer into this equivalent 2D representation.
+        Load weights from a Conv3d layer into this optimized equivalent representation.
 
         Args:
             conv3d_weight: Tensor of shape (out_channels, in_channels, kd, kh, kw)
@@ -499,14 +505,14 @@ class Conv3DEquivalent(nn.Module):
         assert c_out == self.out_channels and c_in == self.in_channels, \
             f"Channel mismatch: expected {(self.out_channels, self.in_channels)}, got {(c_out, c_in)}"
 
-        # Extract 2D slices from 3D kernel and assign to corresponding 2D conv layers
-        for dd in range(kd):
-            kernel_2d = conv3d_weight[:, :, dd, :, :]  # (c_out, c_in, kh, kw)
-            self.conv2d_layers[dd].weight.data = kernel_2d
+        # Reshape 3D kernel to fit the optimized 2D conv structure
+        # (c_out, c_in, kd, kh, kw) -> (c_out, c_in*kd, kh, kw)
+        kernel_2d = conv3d_weight.reshape(c_out, c_in * kd, kh, kw)
+        self.conv2d.weight.data = kernel_2d
 
         # Load bias if present
-        if conv3d_bias is not None and self.bias is not None:
-            self.bias.data = conv3d_bias
+        if conv3d_bias is not None:
+            self.conv2d.bias.data = conv3d_bias
 
 
 class BatchNorm3DEquivalent(nn.Module):
@@ -527,13 +533,13 @@ class BatchNorm3DEquivalent(nn.Module):
         bs, c, d, h, w = x.shape
 
         # Reshape to process all depth slices together: (bs*d, c, h, w)
-        x_reshaped = x.view(bs * d, c, h, w)
+        x_reshaped = x.reshape(bs * d, c, h, w)
 
         # Apply 2D batch norm (mathematically equivalent to 3D)
         output_reshaped = self.norm2d(x_reshaped)  # (bs*d, c, h, w)
 
         # Reshape back: (bs, c, d, h, w)
-        output = output_reshaped.view(bs, c, d, h, w)
+        output = output_reshaped.reshape(bs, c, d, h, w)
 
         return output
 
