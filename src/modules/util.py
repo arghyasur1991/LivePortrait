@@ -18,22 +18,35 @@ def kp2gaussian(kp, spatial_size, kp_variance):
     """
     Transform a keypoint into gaussian like representation
     """
-    mean = kp
+    mean = kp  # (bs, num_kp, 3)
 
+    # Get coordinate grid: (d, h, w, 3) - 4D
     coordinate_grid = make_coordinate_grid(spatial_size, mean)
-    number_of_leading_dimensions = len(mean.shape) - 1
-    shape = (1,) * number_of_leading_dimensions + coordinate_grid.shape
-    coordinate_grid = coordinate_grid.view(*shape)
-    repeats = mean.shape[:number_of_leading_dimensions] + (1, 1, 1, 1)
-    coordinate_grid = coordinate_grid.repeat(*repeats)
 
-    # Preprocess kp shape
-    shape = mean.shape[:number_of_leading_dimensions] + (1, 1, 1, 3)
-    mean = mean.view(*shape)
+    # Process each batch and keypoint separately to avoid 6D tensors
+    bs = mean.shape[0]
+    num_kp = mean.shape[1]
+    d, h, w = spatial_size
 
-    mean_sub = (coordinate_grid - mean)
+    # Prepare coordinate grid for broadcasting: (d, h, w, 3) -> (1, d, h, w, 3) - 5D
+    coordinate_grid = coordinate_grid.unsqueeze(0)  # (1, d, h, w, 3)
 
-    out = torch.exp(-0.5 * (mean_sub ** 2).sum(-1) / kp_variance)
+    # Process all keypoints for all batches simultaneously but within 5D constraint
+    # Reshape mean to (bs*num_kp, 3) and coordinate_grid to (bs*num_kp, d, h, w, 3)
+    mean_flat = mean.view(bs * num_kp, 3)  # (bs*num_kp, 3) - 2D
+    coordinate_grid_expanded = coordinate_grid.repeat(bs * num_kp, 1, 1, 1, 1)  # (bs*num_kp, d, h, w, 3) - 5D
+
+    # Reshape mean for broadcasting: (bs*num_kp, 3) -> (bs*num_kp, 1, 1, 1, 3) - 5D
+    mean_expanded = mean_flat.view(bs * num_kp, 1, 1, 1, 3)  # (bs*num_kp, 1, 1, 1, 3) - 5D
+
+    # Calculate mean_sub: (bs*num_kp, d, h, w, 3) - 5D
+    mean_sub = coordinate_grid_expanded - mean_expanded
+
+    # Calculate gaussian: (bs*num_kp, d, h, w) - 4D
+    out_flat = torch.exp(-0.5 * (mean_sub ** 2).sum(-1) / kp_variance)
+
+    # Reshape back to (bs, num_kp, d, h, w) - 5D
+    out = out_flat.view(bs, num_kp, d, h, w)
 
     return out
 
