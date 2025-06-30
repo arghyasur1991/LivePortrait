@@ -141,19 +141,19 @@ def load_equivalent_weights(module, state_dict, prefix=""):
     """
     from ..modules.util import Conv3DEquivalent, BatchNorm3DEquivalent
 
-    # Handle Conv3DEquivalent layers
-    if isinstance(module, Conv3DEquivalent):
-        conv_key = prefix + "weight"
-        bias_key = prefix + "bias"
+    # Handle nn.Conv3d layers
+    # if isinstance(module, nn.Conv3d):
+    #     conv_key = prefix + "weight"
+    #     bias_key = prefix + "bias"
 
-        if conv_key in state_dict:
-            conv3d_weight = state_dict[conv_key]
-            conv3d_bias = state_dict.get(bias_key, None)
-            module.load_conv3d_weights(conv3d_weight, conv3d_bias)
-            return
+    #     if conv_key in state_dict:
+    #         conv3d_weight = state_dict[conv_key]
+    #         conv3d_bias = state_dict.get(bias_key, None)
+    #         module.load_conv3d_weights(conv3d_weight, conv3d_bias)
+    #         return
 
     # Handle BatchNorm3DEquivalent layers
-    elif isinstance(module, BatchNorm3DEquivalent):
+    if isinstance(module, BatchNorm3DEquivalent):
         weight_key = prefix + "weight"
         bias_key = prefix + "bias"
         running_mean_key = prefix + "running_mean"

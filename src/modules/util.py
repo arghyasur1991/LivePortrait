@@ -121,7 +121,7 @@ class UpBlock3d(nn.Module):
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(UpBlock3d, self).__init__()
 
-        self.conv = Conv3DEquivalent(in_features, out_features, kernel_size=kernel_size,
+        self.conv = nn.Conv3d(in_features, out_features, kernel_size=kernel_size,
                               padding=padding)
         self.norm = BatchNorm3DEquivalent(out_features, affine=True)
 
@@ -162,7 +162,7 @@ class DownBlock3d(nn.Module):
         # Original 3D convolution - now using equivalent 2D approach
         # self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
         #                         padding=padding, groups=groups, stride=(1, 2, 2))
-        self.conv = Conv3DEquivalent(in_features, out_features, kernel_size=kernel_size,
+        self.conv = nn.Conv3d(in_features, out_features, kernel_size=kernel_size,
                               padding=padding)
         self.norm = BatchNorm3DEquivalent(out_features, affine=True)
         # Use 2D pooling to maintain rank 4 constraint
@@ -419,7 +419,7 @@ class Conv3DEquivalent(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
-        super(Conv3DEquivalent, self).__init__()
+        super(nn.Conv3d, self).__init__()
 
         # Handle kernel_size as int or tuple
         if isinstance(kernel_size, int):
@@ -596,7 +596,7 @@ class Decoder(nn.Module):
         self.up_blocks = nn.ModuleList(up_blocks)
         self.out_filters = block_expansion + in_features
 
-        self.conv = Conv3DEquivalent(self.out_filters, self.out_filters, kernel_size=3, padding=1)
+        self.conv = nn.Conv3d(self.out_filters, self.out_filters, kernel_size=3, padding=1)
         self.norm = BatchNorm3DEquivalent(self.out_filters, affine=True)
 
     def forward(self, x):
