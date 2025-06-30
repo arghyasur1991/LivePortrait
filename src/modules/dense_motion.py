@@ -96,17 +96,53 @@ class DenseMotionNetwork(nn.Module):
     def forward(self, feature, kp_driving, kp_source):
         bs, _, d, h, w = feature.shape  # (bs, 32, 16, 64, 64)
 
-        # Reshape to 4D for 2D compression: (bs, c, d, h, w) -> (bs*d, c, h, w)
-        feature_reshaped = feature.view(bs * d, feature.shape[1], h, w)
+        # Improved depth-aware 2D convolution approach
+        # Instead of processing each depth slice independently, we'll use overlapping depth contexts
+        # This better approximates the cross-depth mixing of 3D convolution
 
-        # Apply 2D operations
-        feature_compressed = self.compress(feature_reshaped)  # (bs*d, 4, h, w)
-        feature_compressed = self.norm(feature_compressed)  # (bs*d, 4, h, w)
-        feature_compressed = F.relu(feature_compressed)  # (bs*d, 4, h, w)
+        compressed_slices = []
 
-        # Reshape back to 5D: (bs*d, 4, h, w) -> (bs, 4, d, h, w)
-        c_compressed = feature_compressed.shape[1]
-        feature = feature_compressed.view(bs, c_compressed, d, h, w)
+        for d_idx in range(d):
+            # For each depth slice, include context from neighboring slices
+            # This approximates the depth kernel of 3D convolution
+            kernel_radius = 1  # Approximate 3x3x3 kernel with radius 1 in depth
+            start_d = max(0, d_idx - kernel_radius)
+            end_d = min(d, d_idx + kernel_radius + 1)
+
+            # Extract depth context: (bs, c, context_depth, h, w)
+            depth_context = feature[:, :, start_d:end_d, :, :]
+
+            # Better depth mixing using weighted combination instead of simple averaging
+            # This more closely approximates how 3D convolution weights would combine depth information
+            context_depth = depth_context.shape[2]
+
+            if context_depth == 1:
+                # Edge case: only one depth slice available
+                context_slice = depth_context.squeeze(2)
+            elif context_depth == 2:
+                # Two slices: weighted average emphasizing current position
+                if d_idx == 0:  # First slice
+                    weights = torch.tensor([0.7, 0.3], device=feature.device, dtype=feature.dtype)
+                else:  # Last slice
+                    weights = torch.tensor([0.3, 0.7], device=feature.device, dtype=feature.dtype)
+                weighted_context = depth_context * weights.view(1, 1, -1, 1, 1)
+                context_slice = weighted_context.sum(dim=2)
+            else:
+                # Three slices: Gaussian-like weighting [0.25, 0.5, 0.25]
+                weights = torch.tensor([0.25, 0.5, 0.25], device=feature.device, dtype=feature.dtype)
+                weighted_context = depth_context * weights.view(1, 1, -1, 1, 1)
+                context_slice = weighted_context.sum(dim=2)
+
+            # Apply 2D operations to this depth-aware slice
+            compressed_slice = self.compress(context_slice)  # (bs, c_out, h, w)
+            compressed_slice = self.norm(compressed_slice)
+            compressed_slice = F.relu(compressed_slice)
+
+            compressed_slices.append(compressed_slice)
+
+        # Stack all depth slices: (bs, c_out, d, h, w)
+        c_compressed = compressed_slices[0].shape[1]
+        feature = torch.stack(compressed_slices, dim=2)  # (bs, c_out, d, h, w)
 
         out_dict = dict()
 

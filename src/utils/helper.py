@@ -130,8 +130,13 @@ def remove_ddp_dumplicate_key(state_dict):
 
 def adapt_conv3d_to_conv2d_weights(state_dict, model_state_dict):
     """
-    Adapt 3D convolution weights to 2D convolution weights by averaging across the depth dimension.
-    This allows loading pretrained 3D weights into 2D convolution layers.
+    Adapt 3D convolution weights to 2D convolution weights using mathematically sound approaches.
+
+    For 3D conv weights [out_c, in_c, kd, kh, kw] -> 2D conv weights [out_c, in_c, kh, kw]:
+
+    1. For kernel_depth=1: Direct squeeze
+    2. For kernel_depth=3: Use center slice with neighbor averaging
+    3. For kernel_depth=7: Use Gaussian-weighted combination
     """
     adapted_state_dict = OrderedDict()
 
@@ -146,11 +151,64 @@ def adapt_conv3d_to_conv2d_weights(state_dict, model_state_dict):
                 checkpoint_shape[:2] == model_shape[:2] and
                 checkpoint_shape[3:] == model_shape[2:]):
 
-                # Convert 3D conv weight to 2D by averaging across depth dimension
-                # Shape: [out_channels, in_channels, depth, height, width] -> [out_channels, in_channels, height, width]
-                adapted_param = checkpoint_param.mean(dim=2)
+                depth_size = checkpoint_shape[2]
+
+                if depth_size == 1:
+                    # Direct squeeze for depth=1
+                    adapted_param = checkpoint_param.squeeze(2)
+                    method = "squeeze"
+
+                elif depth_size == 3:
+                    # For 3x3x3 kernels, use center slice enhanced with neighbor information
+                    # This preserves the central learned pattern while incorporating depth context
+                    center_slice = checkpoint_param[:, :, 1, :, :]  # Center slice
+                    prev_slice = checkpoint_param[:, :, 0, :, :]    # Previous slice
+                    next_slice = checkpoint_param[:, :, 2, :, :]    # Next slice
+
+                    # Weighted combination: center gets most weight, neighbors provide context
+                    # Weights: [0.2, 0.6, 0.2] - center-focused but depth-aware
+                    adapted_param = 0.6 * center_slice + 0.2 * prev_slice + 0.2 * next_slice
+                    method = "weighted_center"
+
+                elif depth_size == 7:
+                    # For 7x7x7 kernels, use Gaussian-weighted combination
+                    # Create Gaussian weights centered on middle slice
+                    center = depth_size // 2
+                    sigma = depth_size / 6.0  # Spread across ~99% of kernel
+
+                    depth_indices = torch.arange(depth_size, dtype=checkpoint_param.dtype, device=checkpoint_param.device)
+                    gaussian_weights = torch.exp(-0.5 * ((depth_indices - center) / sigma) ** 2)
+                    gaussian_weights = gaussian_weights / gaussian_weights.sum()
+
+                    # Apply weighted combination across depth dimension
+                    adapted_param = torch.zeros_like(checkpoint_param[:, :, 0, :, :])
+                    for d_idx in range(depth_size):
+                        adapted_param += gaussian_weights[d_idx] * checkpoint_param[:, :, d_idx, :, :]
+
+                    method = "gaussian_weighted"
+
+                else:
+                    # For other sizes, use enhanced center slice approach
+                    center = depth_size // 2
+                    center_slice = checkpoint_param[:, :, center, :, :]
+
+                    # If possible, average with immediate neighbors for better approximation
+                    if depth_size >= 3:
+                        neighbor_weight = 0.15
+                        main_weight = 1.0 - 2 * neighbor_weight
+
+                        adapted_param = main_weight * center_slice
+                        if center > 0:
+                            adapted_param += neighbor_weight * checkpoint_param[:, :, center-1, :, :]
+                        if center < depth_size - 1:
+                            adapted_param += neighbor_weight * checkpoint_param[:, :, center+1, :, :]
+                    else:
+                        adapted_param = center_slice
+
+                    method = "enhanced_center"
+
                 adapted_state_dict[key] = adapted_param
-                print(f"Adapted {key}: {checkpoint_shape} -> {adapted_param.shape}")
+                print(f"Adapted {key}: {checkpoint_shape} -> {adapted_param.shape} (method: {method})")
 
             # Check if this is a conv bias (should match directly)
             elif checkpoint_shape == model_shape:
@@ -158,10 +216,20 @@ def adapt_conv3d_to_conv2d_weights(state_dict, model_state_dict):
 
             else:
                 print(f"Warning: Could not adapt {key}: checkpoint shape {checkpoint_shape} vs model shape {model_shape}")
-                adapted_state_dict[key] = checkpoint_param
+                # Skip mismatched parameters rather than forcing them
+                continue
         else:
             # Key not in model, skip it
             print(f"Warning: Key {key} not found in model, skipping")
+
+    # Check for missing model parameters
+    missing_keys = set(model_state_dict.keys()) - set(adapted_state_dict.keys())
+    if missing_keys:
+        print(f"Warning: {len(missing_keys)} model parameters not found in checkpoint, will use default initialization")
+        for key in list(missing_keys)[:5]:  # Show first 5
+            print(f"  Missing: {key}")
+        if len(missing_keys) > 5:
+            print(f"  ... and {len(missing_keys) - 5} more")
 
     return adapted_state_dict
 
