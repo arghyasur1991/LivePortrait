@@ -59,6 +59,14 @@ class CorrectedWarpingSpadeWrapper(nn.Module):
 
         return final_image
 
+def adjust_reshape_nodes(model):
+    """Adjust reshape nodes if rank > 5 to lower ranks"""
+    for node in model.graph.node:
+        if node.op_type == "Reshape":
+            a = 0
+            #TODO
+    return model
+
 def export_warping_spade_from_pytorch(output_path):
     """Export warping_spade directly from PyTorch modules with corrected parameter order"""
     print(f"🔧 Exporting warping_spade from PyTorch modules...")
@@ -124,6 +132,8 @@ def export_warping_spade_from_pytorch(output_path):
                 'kp_source': [1, 21, 3]
             }
         )
+
+        model_opt = adjust_reshape_nodes(model_simp)
 
         if check:
             onnx.save(model_simp, output_path)
