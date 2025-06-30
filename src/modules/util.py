@@ -33,11 +33,11 @@ def kp2gaussian(kp, spatial_size, kp_variance):
 
     # Process all keypoints for all batches simultaneously but within 5D constraint
     # Reshape mean to (bs*num_kp, 3) and coordinate_grid to (bs*num_kp, d, h, w, 3)
-    mean_flat = mean.reshape(bs * num_kp, 3)  # (bs*num_kp, 3) - 2D
+    mean_flat = mean.view(bs * num_kp, 3)  # (bs*num_kp, 3) - 2D
     coordinate_grid_expanded = coordinate_grid.repeat(bs * num_kp, 1, 1, 1, 1)  # (bs*num_kp, d, h, w, 3) - 5D
 
     # Reshape mean for broadcasting: (bs*num_kp, 3) -> (bs*num_kp, 1, 1, 1, 3) - 5D
-    mean_expanded = mean_flat.reshape(bs * num_kp, 1, 1, 1, 3)  # (bs*num_kp, 1, 1, 1, 3) - 5D
+    mean_expanded = mean_flat.view(bs * num_kp, 1, 1, 1, 3)  # (bs*num_kp, 1, 1, 1, 3) - 5D
 
     # Calculate mean_sub: (bs*num_kp, d, h, w, 3) - 5D
     mean_sub = coordinate_grid_expanded - mean_expanded
@@ -46,7 +46,7 @@ def kp2gaussian(kp, spatial_size, kp_variance):
     out_flat = torch.exp(-0.5 * (mean_sub ** 2).sum(-1) / kp_variance)
 
     # Reshape back to (bs, num_kp, d, h, w) - 5D
-    out = out_flat.reshape(bs, num_kp, d, h, w)
+    out = out_flat.view(bs, num_kp, d, h, w)
 
     return out
 
@@ -121,9 +121,9 @@ class UpBlock3d(nn.Module):
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(UpBlock3d, self).__init__()
 
-        self.conv = nn.Conv3d(in_features, out_features, kernel_size=kernel_size,
-                              padding=padding)
-        self.norm = BatchNorm3DEquivalent(out_features, affine=True)
+        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
+                              padding=padding, groups=groups)
+        self.norm = nn.BatchNorm3d(out_features, affine=True)
 
     def forward(self, x):
         out = F.interpolate(x, scale_factor=(1, 2, 2))
@@ -159,12 +159,13 @@ class DownBlock3d(nn.Module):
 
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(DownBlock3d, self).__init__()
-        # Original 3D convolution - now using equivalent 2D approach
-        # self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
-        #                         padding=padding, groups=groups, stride=(1, 2, 2))
-        self.conv = nn.Conv3d(in_features, out_features, kernel_size=kernel_size,
-                              padding=padding)
-        self.norm = BatchNorm3DEquivalent(out_features, affine=True)
+        '''
+        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
+                                padding=padding, groups=groups, stride=(1, 2, 2))
+        '''
+        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
+                              padding=padding, groups=groups)
+        self.norm = nn.BatchNorm3d(out_features, affine=True)
         # Use 2D pooling to maintain rank 4 constraint
         self.pool = nn.AvgPool2d(kernel_size=(2, 2))
 
@@ -175,14 +176,14 @@ class DownBlock3d(nn.Module):
 
         # Reshape to 4D for 2D pooling: (bs, c, d, h, w) -> (bs*d, c, h, w)
         bs, c, d, h, w = out.shape
-        out_reshaped = out.reshape(bs * d, c, h, w)  # (bs*d, c, h, w) - 4D
+        out_reshaped = out.view(bs * d, c, h, w)  # (bs*d, c, h, w) - 4D
 
         # Apply 2D pooling: (bs*d, c, h, w) -> (bs*d, c, h//2, w//2) - 4D
         out_pooled = self.pool(out_reshaped)
 
         # Reshape back to 5D: (bs*d, c, h//2, w//2) -> (bs, c, d, h//2, w//2)
         _, _, h_new, w_new = out_pooled.shape
-        out = out_pooled.reshape(bs, c, d, h_new, w_new)  # (bs, c, d, h//2, w//2) - 5D
+        out = out_pooled.view(bs, c, d, h_new, w_new)  # (bs, c, d, h//2, w//2) - 5D
 
         return out
 
@@ -208,7 +209,72 @@ class SameBlock2d(nn.Module):
         return out
 
 
+class Encoder(nn.Module):
+    """
+    Hourglass Encoder
+    """
 
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Encoder, self).__init__()
+
+        down_blocks = []
+        for i in range(num_blocks):
+            down_blocks.append(DownBlock3d(in_features if i == 0 else min(max_features, block_expansion * (2 ** i)), min(max_features, block_expansion * (2 ** (i + 1))), kernel_size=3, padding=1))
+        self.down_blocks = nn.ModuleList(down_blocks)
+
+    def forward(self, x):
+        outs = [x]
+        for down_block in self.down_blocks:
+            outs.append(down_block(outs[-1]))
+        return outs
+
+
+class Decoder(nn.Module):
+    """
+    Hourglass Decoder
+    """
+
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Decoder, self).__init__()
+
+        up_blocks = []
+
+        for i in range(num_blocks)[::-1]:
+            in_filters = (1 if i == num_blocks - 1 else 2) * min(max_features, block_expansion * (2 ** (i + 1)))
+            out_filters = min(max_features, block_expansion * (2 ** i))
+            up_blocks.append(UpBlock3d(in_filters, out_filters, kernel_size=3, padding=1))
+
+        self.up_blocks = nn.ModuleList(up_blocks)
+        self.out_filters = block_expansion + in_features
+
+        self.conv = nn.Conv3d(in_channels=self.out_filters, out_channels=self.out_filters, kernel_size=3, padding=1)
+        self.norm = nn.BatchNorm3d(self.out_filters, affine=True)
+
+    def forward(self, x):
+        out = x.pop()
+        for up_block in self.up_blocks:
+            out = up_block(out)
+            skip = x.pop()
+            out = torch.cat([out, skip], dim=1)
+        out = self.conv(out)
+        out = self.norm(out)
+        out = F.relu(out)
+        return out
+
+
+class Hourglass(nn.Module):
+    """
+    Hourglass architecture.
+    """
+
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Hourglass, self).__init__()
+        self.encoder = Encoder(block_expansion, in_features, num_blocks, max_features)
+        self.decoder = Decoder(block_expansion, in_features, num_blocks, max_features)
+        self.out_filters = self.decoder.out_filters
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
 
 
 class SPADE(nn.Module):
@@ -556,71 +622,3 @@ class BatchNorm3DEquivalent(nn.Module):
 
 
 
-
-
-class Encoder(nn.Module):
-    """
-    Hourglass Encoder (original version)
-    """
-
-    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
-        super(Encoder, self).__init__()
-
-        down_blocks = []
-        for i in range(num_blocks):
-            down_blocks.append(DownBlock3d(in_features if i == 0 else min(max_features, block_expansion * (2 ** i)), min(max_features, block_expansion * (2 ** (i + 1))), kernel_size=3, padding=1))
-        self.down_blocks = nn.ModuleList(down_blocks)
-
-    def forward(self, x):
-        outs = [x]
-        for down_block in self.down_blocks:
-            outs.append(down_block(outs[-1]))
-        return outs
-
-
-class Decoder(nn.Module):
-    """
-    Hourglass Decoder (original version)
-    """
-
-    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
-        super(Decoder, self).__init__()
-
-        up_blocks = []
-
-        for i in range(num_blocks)[::-1]:
-            in_filters = (1 if i == num_blocks - 1 else 2) * min(max_features, block_expansion * (2 ** (i + 1)))
-            out_filters = min(max_features, block_expansion * (2 ** i))
-            up_blocks.append(UpBlock3d(in_filters, out_filters, kernel_size=3, padding=1))
-
-        self.up_blocks = nn.ModuleList(up_blocks)
-        self.out_filters = block_expansion + in_features
-
-        self.conv = nn.Conv3d(self.out_filters, self.out_filters, kernel_size=3, padding=1)
-        self.norm = BatchNorm3DEquivalent(self.out_filters, affine=True)
-
-    def forward(self, x):
-        out = x.pop()
-        for up_block in self.up_blocks:
-            out = up_block(out)
-            skip = x.pop()
-            out = torch.cat([out, skip], dim=1)
-        out = self.conv(out)
-        out = self.norm(out)
-        out = F.relu(out)
-        return out
-
-
-class Hourglass(nn.Module):
-    """
-    Hourglass architecture (original version)
-    """
-
-    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
-        super(Hourglass, self).__init__()
-        self.encoder = Encoder(block_expansion, in_features, num_blocks, max_features)
-        self.decoder = Decoder(block_expansion, in_features, num_blocks, max_features)
-        self.out_filters = self.decoder.out_filters
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
