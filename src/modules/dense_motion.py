@@ -15,9 +15,9 @@ class DenseMotionNetwork(nn.Module):
         super(DenseMotionNetwork, self).__init__()
         self.hourglass = Hourglass(block_expansion=block_expansion, in_features=(num_kp+1)*(compress+1), max_features=max_features, num_blocks=num_blocks)  # ~60+G
 
-        self.mask = nn.Conv3d(self.hourglass.out_filters, num_kp + 1, kernel_size=7, padding=3)  # 65G! NOTE: computation cost is large
-        self.compress = nn.Conv3d(feature_channel, compress, kernel_size=1)  # 0.8G
-        self.norm = nn.BatchNorm3d(compress, affine=True)
+        self.mask = nn.Conv2d(self.hourglass.out_filters, num_kp + 1, kernel_size=7, padding=3)  # 65G! NOTE: computation cost is large
+        self.compress = nn.Conv2d(feature_channel, compress, kernel_size=1)  # 0.8G
+        self.norm = nn.BatchNorm2d(compress, affine=True)
         self.num_kp = num_kp
         self.flag_estimate_occlusion_map = estimate_occlusion_map
 
@@ -96,9 +96,17 @@ class DenseMotionNetwork(nn.Module):
     def forward(self, feature, kp_driving, kp_source):
         bs, _, d, h, w = feature.shape  # (bs, 32, 16, 64, 64)
 
-        feature = self.compress(feature)  # (bs, 4, 16, 64, 64)
-        feature = self.norm(feature)  # (bs, 4, 16, 64, 64)
-        feature = F.relu(feature)  # (bs, 4, 16, 64, 64)
+        # Reshape to 4D for 2D compression: (bs, c, d, h, w) -> (bs*d, c, h, w)
+        feature_reshaped = feature.view(bs * d, feature.shape[1], h, w)
+
+        # Apply 2D operations
+        feature_compressed = self.compress(feature_reshaped)  # (bs*d, 4, h, w)
+        feature_compressed = self.norm(feature_compressed)  # (bs*d, 4, h, w)
+        feature_compressed = F.relu(feature_compressed)  # (bs*d, 4, h, w)
+
+        # Reshape back to 5D: (bs*d, 4, h, w) -> (bs, 4, d, h, w)
+        c_compressed = feature_compressed.shape[1]
+        feature = feature_compressed.view(bs, c_compressed, d, h, w)
 
         out_dict = dict()
 
@@ -126,7 +134,17 @@ class DenseMotionNetwork(nn.Module):
 
         prediction = self.hourglass(input)
 
-        mask = self.mask(prediction)
+        # Reshape prediction for 2D mask convolution: (bs, c, d, h, w) -> (bs*d, c, h, w)
+        bs, c_pred, d, h, w = prediction.shape
+        prediction_reshaped = prediction.view(bs * d, c_pred, h, w)
+
+        # Apply 2D mask convolution
+        mask_reshaped = self.mask(prediction_reshaped)  # (bs*d, num_kp+1, h, w)
+
+        # Reshape back to 5D: (bs*d, num_kp+1, h, w) -> (bs, num_kp+1, d, h, w)
+        num_kp_plus_1 = mask_reshaped.shape[1]
+        mask = mask_reshaped.view(bs, num_kp_plus_1, d, h, w)
+
         mask = F.softmax(mask, dim=1)  # (bs, 1+num_kp, d=16, h=64, w=64) - 5D
         out_dict['mask'] = mask
 

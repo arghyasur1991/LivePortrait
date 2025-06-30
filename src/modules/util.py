@@ -113,6 +113,39 @@ class ResBlock3d(nn.Module):
         return out
 
 
+class ResBlock2d(nn.Module):
+    """
+    Res block for 2D operations, used in warping components to maintain rank 4.
+    """
+
+    def __init__(self, in_features, kernel_size, padding):
+        super(ResBlock2d, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size, padding=padding)
+        self.conv2 = nn.Conv2d(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size, padding=padding)
+        self.norm1 = nn.BatchNorm2d(in_features, affine=True)
+        self.norm2 = nn.BatchNorm2d(in_features, affine=True)
+
+    def forward(self, x):
+        # Input: (bs, c, d, h, w) - 5D
+        bs, c, d, h, w = x.shape
+
+        # Reshape to 4D: (bs*d, c, h, w)
+        x_reshaped = x.view(bs * d, c, h, w)
+
+        # Apply 2D operations
+        out = self.norm1(x_reshaped)
+        out = F.relu(out)
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = F.relu(out)
+        out = self.conv2(out)
+        out += x_reshaped  # residual connection
+
+        # Reshape back to 5D: (bs, c, d, h, w)
+        out = out.view(bs, c, d, h, w)
+        return out
+
+
 class UpBlock3d(nn.Module):
     """
     Upsampling block for use in decoder.
@@ -121,15 +154,29 @@ class UpBlock3d(nn.Module):
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(UpBlock3d, self).__init__()
 
-        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
+        self.conv = nn.Conv2d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
                               padding=padding, groups=groups)
-        self.norm = nn.BatchNorm3d(out_features, affine=True)
+        self.norm = nn.BatchNorm2d(out_features, affine=True)
 
     def forward(self, x):
+        # Input: (bs, c, d, h, w) - 5D
+        bs, c, d, h, w = x.shape
+
+        # Apply 3D interpolation first (only spatial upsampling)
         out = F.interpolate(x, scale_factor=(1, 2, 2))
-        out = self.conv(out)
-        out = self.norm(out)
-        out = F.relu(out)
+
+        # Reshape to 4D for 2D conv: (bs, c, d, h*2, w*2) -> (bs*d, c, h*2, w*2)
+        _, _, d, h_new, w_new = out.shape
+        out_reshaped = out.view(bs * d, c, h_new, w_new)
+
+        # Apply 2D operations
+        out_reshaped = self.conv(out_reshaped)
+        out_reshaped = self.norm(out_reshaped)
+        out_reshaped = F.relu(out_reshaped)
+
+        # Reshape back to 5D: (bs, c_out, d, h*2, w*2)
+        c_out = out_reshaped.shape[1]
+        out = out_reshaped.view(bs, c_out, d, h_new, w_new)
         return out
 
 
@@ -159,31 +206,30 @@ class DownBlock3d(nn.Module):
 
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(DownBlock3d, self).__init__()
-        '''
-        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
-                                padding=padding, groups=groups, stride=(1, 2, 2))
-        '''
-        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
+        self.conv = nn.Conv2d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
                               padding=padding, groups=groups)
-        self.norm = nn.BatchNorm3d(out_features, affine=True)
+        self.norm = nn.BatchNorm2d(out_features, affine=True)
         # Use 2D pooling to maintain rank 4 constraint
         self.pool = nn.AvgPool2d(kernel_size=(2, 2))
 
     def forward(self, x):
-        out = self.conv(x)
+        # Input: (bs, c, d, h, w) - 5D
+        bs, c, d, h, w = x.shape
+
+        # Reshape to 4D for 2D operations: (bs*d, c, h, w)
+        x_reshaped = x.view(bs * d, c, h, w)
+
+        # Apply 2D operations
+        out = self.conv(x_reshaped)
         out = self.norm(out)
         out = F.relu(out)
 
-        # Reshape to 4D for 2D pooling: (bs, c, d, h, w) -> (bs*d, c, h, w)
-        bs, c, d, h, w = out.shape
-        out_reshaped = out.view(bs * d, c, h, w)  # (bs*d, c, h, w) - 4D
+        # Apply 2D pooling: (bs*d, c_out, h, w) -> (bs*d, c_out, h//2, w//2) - 4D
+        out_pooled = self.pool(out)
 
-        # Apply 2D pooling: (bs*d, c, h, w) -> (bs*d, c, h//2, w//2) - 4D
-        out_pooled = self.pool(out_reshaped)
-
-        # Reshape back to 5D: (bs*d, c, h//2, w//2) -> (bs, c, d, h//2, w//2)
-        _, _, h_new, w_new = out_pooled.shape
-        out = out_pooled.view(bs, c, d, h_new, w_new)  # (bs, c, d, h//2, w//2) - 5D
+        # Reshape back to 5D: (bs*d, c_out, h//2, w//2) -> (bs, c_out, d, h//2, w//2)
+        c_out, h_new, w_new = out_pooled.shape[1], out_pooled.shape[2], out_pooled.shape[3]
+        out = out_pooled.view(bs, c_out, d, h_new, w_new)
 
         return out
 
@@ -247,8 +293,8 @@ class Decoder(nn.Module):
         self.up_blocks = nn.ModuleList(up_blocks)
         self.out_filters = block_expansion + in_features
 
-        self.conv = nn.Conv3d(in_channels=self.out_filters, out_channels=self.out_filters, kernel_size=3, padding=1)
-        self.norm = nn.BatchNorm3d(self.out_filters, affine=True)
+        self.conv = nn.Conv2d(in_channels=self.out_filters, out_channels=self.out_filters, kernel_size=3, padding=1)
+        self.norm = nn.BatchNorm2d(self.out_filters, affine=True)
 
     def forward(self, x):
         out = x.pop()
@@ -256,9 +302,20 @@ class Decoder(nn.Module):
             out = up_block(out)
             skip = x.pop()
             out = torch.cat([out, skip], dim=1)
-        out = self.conv(out)
-        out = self.norm(out)
-        out = F.relu(out)
+
+        # Input: (bs, c, d, h, w) - 5D
+        bs, c, d, h, w = out.shape
+
+        # Reshape to 4D for 2D operations: (bs*d, c, h, w)
+        out_reshaped = out.view(bs * d, c, h, w)
+
+        # Apply 2D operations
+        out_reshaped = self.conv(out_reshaped)
+        out_reshaped = self.norm(out_reshaped)
+        out_reshaped = F.relu(out_reshaped)
+
+        # Reshape back to 5D: (bs, c, d, h, w)
+        out = out_reshaped.view(bs, c, d, h, w)
         return out
 
 

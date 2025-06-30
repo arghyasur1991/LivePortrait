@@ -128,6 +128,44 @@ def remove_ddp_dumplicate_key(state_dict):
     return state_dict_new
 
 
+def adapt_conv3d_to_conv2d_weights(state_dict, model_state_dict):
+    """
+    Adapt 3D convolution weights to 2D convolution weights by averaging across the depth dimension.
+    This allows loading pretrained 3D weights into 2D convolution layers.
+    """
+    adapted_state_dict = OrderedDict()
+
+    for key, checkpoint_param in state_dict.items():
+        if key in model_state_dict:
+            model_param = model_state_dict[key]
+            checkpoint_shape = checkpoint_param.shape
+            model_shape = model_param.shape
+
+            # Check if this is a conv weight that needs adaptation
+            if (len(checkpoint_shape) == 5 and len(model_shape) == 4 and
+                checkpoint_shape[:2] == model_shape[:2] and
+                checkpoint_shape[3:] == model_shape[2:]):
+
+                # Convert 3D conv weight to 2D by averaging across depth dimension
+                # Shape: [out_channels, in_channels, depth, height, width] -> [out_channels, in_channels, height, width]
+                adapted_param = checkpoint_param.mean(dim=2)
+                adapted_state_dict[key] = adapted_param
+                print(f"Adapted {key}: {checkpoint_shape} -> {adapted_param.shape}")
+
+            # Check if this is a conv bias (should match directly)
+            elif checkpoint_shape == model_shape:
+                adapted_state_dict[key] = checkpoint_param
+
+            else:
+                print(f"Warning: Could not adapt {key}: checkpoint shape {checkpoint_shape} vs model shape {model_shape}")
+                adapted_state_dict[key] = checkpoint_param
+        else:
+            # Key not in model, skip it
+            print(f"Warning: Key {key} not found in model, skipping")
+
+    return adapted_state_dict
+
+
 def load_model(ckpt_path, model_config, device, model_type):
     model_params = model_config['model_params'][f'{model_type}_params']
 
@@ -167,7 +205,17 @@ def load_model(ckpt_path, model_config, device, model_type):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    model.load_state_dict(torch.load(ckpt_path, map_location=lambda storage, loc: storage))
+    # Load checkpoint
+    checkpoint_state_dict = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+
+    # Special handling for warping_module to adapt 3D->2D weights
+    if model_type == 'warping_module':
+        model_state_dict = model.state_dict()
+        adapted_state_dict = adapt_conv3d_to_conv2d_weights(checkpoint_state_dict, model_state_dict)
+        model.load_state_dict(adapted_state_dict, strict=False)
+    else:
+        model.load_state_dict(checkpoint_state_dict)
+
     model.eval()
     return model
 
