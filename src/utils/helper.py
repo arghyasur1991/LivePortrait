@@ -139,7 +139,7 @@ def load_equivalent_weights(module, state_dict, prefix=""):
         state_dict: The checkpoint state dict
         prefix: The prefix for keys in this module
     """
-    from ..modules.util import Conv3DEquivalent, BatchNorm3DEquivalent
+    from ..modules.util import Conv3DEquivalent
 
     # Handle Conv3DEquivalent layers
     if isinstance(module, Conv3DEquivalent):
@@ -150,22 +150,6 @@ def load_equivalent_weights(module, state_dict, prefix=""):
             conv3d_weight = state_dict[conv_key]
             conv3d_bias = state_dict.get(bias_key, None)
             module.load_conv3d_weights(conv3d_weight, conv3d_bias)
-            return
-
-    # Handle BatchNorm3DEquivalent layers
-    elif isinstance(module, BatchNorm3DEquivalent):
-        weight_key = prefix + "weight"
-        bias_key = prefix + "bias"
-        running_mean_key = prefix + "running_mean"
-        running_var_key = prefix + "running_var"
-
-        if weight_key in state_dict:
-            module.load_batchnorm3d_weights(
-                state_dict.get(weight_key, None),
-                state_dict.get(bias_key, None),
-                state_dict.get(running_mean_key, None),
-                state_dict.get(running_var_key, None)
-            )
             return
 
     # Recursively handle child modules
