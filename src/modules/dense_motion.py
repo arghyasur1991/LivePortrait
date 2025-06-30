@@ -29,39 +29,68 @@ class DenseMotionNetwork(nn.Module):
     def create_sparse_motions(self, feature, kp_driving, kp_source):
         bs, _, d, h, w = feature.shape  # (bs, 4, 16, 64, 64)
         identity_grid = make_coordinate_grid((d, h, w), ref=kp_source)  # (16, 64, 64, 3)
-        identity_grid = identity_grid.view(1, 1, d, h, w, 3)  # (1, 1, d=16, h=64, w=64, 3)
-        coordinate_grid = identity_grid - kp_driving.view(bs, self.num_kp, 1, 1, 1, 3)
+        # Reshape to (3, d, h, w) to have 4 dimensions, then add batch dimension
+        identity_grid = identity_grid.permute(3, 0, 1, 2)  # (3, d=16, h=64, w=64)
+        identity_grid = identity_grid.unsqueeze(0)  # (1, 3, d=16, h=64, w=64) - 5D
 
-        k = coordinate_grid.shape[1]
+        # Work directly with flattened coordinates to avoid 6D tensors
+        # kp_driving: (bs, num_kp, 3) -> (bs, num_kp*3)
+        kp_driving_flat = kp_driving.view(bs, -1)  # (bs, num_kp*3) - 2D
+        kp_source_flat = kp_source.view(bs, -1)    # (bs, num_kp*3) - 2D
 
-        # NOTE: there lacks an one-order flow
-        driving_to_source = coordinate_grid + kp_source.view(bs, self.num_kp, 1, 1, 1, 3)    # (bs, num_kp, d, h, w, 3)
+        # Reshape to broadcast: (bs, num_kp*3, 1, 1, 1)
+        kp_driving_bc = kp_driving_flat.view(bs, -1, 1, 1, 1)  # (bs, num_kp*3, 1, 1, 1) - 5D
+        kp_source_bc = kp_source_flat.view(bs, -1, 1, 1, 1)    # (bs, num_kp*3, 1, 1, 1) - 5D
 
-        # adding background feature
-        identity_grid = identity_grid.repeat(bs, 1, 1, 1, 1, 1)
-        sparse_motions = torch.cat([identity_grid, driving_to_source], dim=1)  # (bs, 1+num_kp, d, h, w, 3)
+        # Expand identity_grid and compute coordinate_grid
+        identity_grid_expanded = identity_grid.repeat(1, self.num_kp, 1, 1, 1)  # (1, num_kp*3, d, h, w) - 5D
+        coordinate_grid = identity_grid_expanded - kp_driving_bc  # (bs, num_kp*3, d, h, w) - 5D
+
+        # Calculate driving_to_source
+        driving_to_source = coordinate_grid + kp_source_bc  # (bs, num_kp*3, d, h, w) - 5D
+
+        # adding background feature - identity_grid for background
+        identity_grid_bg = identity_grid.repeat(bs, 1, 1, 1, 1)  # (bs, 3, d, h, w) - 5D
+        sparse_motions = torch.cat([identity_grid_bg, driving_to_source], dim=1)  # (bs, 3+num_kp*3, d, h, w) - 5D
         return sparse_motions
 
     def create_deformed_feature(self, feature, sparse_motions):
-        bs, _, d, h, w = feature.shape
-        feature_repeat = feature.unsqueeze(1).unsqueeze(1).repeat(1, self.num_kp+1, 1, 1, 1, 1, 1)      # (bs, num_kp+1, 1, c, d, h, w)
-        feature_repeat = feature_repeat.view(bs * (self.num_kp+1), -1, d, h, w)                         # (bs*(num_kp+1), c, d, h, w)
-        sparse_motions = sparse_motions.view((bs * (self.num_kp+1), d, h, w, -1))                       # (bs*(num_kp+1), d, h, w, 3)
-        sparse_deformed = F.grid_sample(feature_repeat, sparse_motions, align_corners=False)
-        sparse_deformed = sparse_deformed.view((bs, self.num_kp+1, -1, d, h, w))                        # (bs, num_kp+1, c, d, h, w)
+        bs, c, d, h, w = feature.shape
 
+        # Process each keypoint separately to avoid 6D tensors
+        deformed_features_list = []
+
+        # Background (identity) feature
+        background_motion = sparse_motions[:, :3, :, :, :]  # (bs, 3, d, h, w) - 5D
+        background_motion_for_sample = background_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
+        background_deformed = F.grid_sample(feature, background_motion_for_sample, align_corners=False)
+        deformed_features_list.append(background_deformed)
+
+        # Process each keypoint
+        for kp_idx in range(self.num_kp):
+            start_idx = 3 + kp_idx * 3
+            end_idx = 3 + (kp_idx + 1) * 3
+            kp_motion = sparse_motions[:, start_idx:end_idx, :, :, :]  # (bs, 3, d, h, w) - 5D
+            kp_motion_for_sample = kp_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
+            kp_deformed = F.grid_sample(feature, kp_motion_for_sample, align_corners=False)
+            deformed_features_list.append(kp_deformed)
+
+        # Concatenate all deformed features: (bs, (num_kp+1)*c, d, h, w) - 5D
+        sparse_deformed = torch.cat(deformed_features_list, dim=1)
         return sparse_deformed
 
     def create_heatmap_representations(self, feature, kp_driving, kp_source):
-        spatial_size = feature.shape[3:]  # (d=16, h=64, w=64)
-        gaussian_driving = kp2gaussian(kp_driving, spatial_size=spatial_size, kp_variance=0.01)  # (bs, num_kp, d, h, w)
-        gaussian_source = kp2gaussian(kp_source, spatial_size=spatial_size, kp_variance=0.01)  # (bs, num_kp, d, h, w)
-        heatmap = gaussian_driving - gaussian_source  # (bs, num_kp, d, h, w)
+        # feature is now (bs, (num_kp+1)*c, d, h, w) - need to extract spatial dimensions
+        bs = feature.shape[0]
+        spatial_size = feature.shape[2:]  # (d=16, h=64, w=64)
+
+        gaussian_driving = kp2gaussian(kp_driving, spatial_size=spatial_size, kp_variance=0.01)  # (bs, num_kp, d, h, w) - 5D
+        gaussian_source = kp2gaussian(kp_source, spatial_size=spatial_size, kp_variance=0.01)  # (bs, num_kp, d, h, w) - 5D
+        heatmap = gaussian_driving - gaussian_source  # (bs, num_kp, d, h, w) - 5D
 
         # adding background feature
         zeros = torch.zeros(heatmap.shape[0], 1, spatial_size[0], spatial_size[1], spatial_size[2]).type(heatmap.dtype).to(heatmap.device)
-        heatmap = torch.cat([zeros, heatmap], dim=1)
-        heatmap = heatmap.unsqueeze(2)         # (bs, 1+num_kp, 1, d, h, w)
+        heatmap = torch.cat([zeros, heatmap], dim=1)  # (bs, 1+num_kp, d, h, w) - 5D
         return heatmap
 
     def forward(self, feature, kp_driving, kp_source):
@@ -74,31 +103,53 @@ class DenseMotionNetwork(nn.Module):
         out_dict = dict()
 
         # 1. deform 3d feature
-        sparse_motion = self.create_sparse_motions(feature, kp_driving, kp_source)  # (bs, 1+num_kp, d, h, w, 3)
-        deformed_feature = self.create_deformed_feature(feature, sparse_motion)  # (bs, 1+num_kp, c=4, d=16, h=64, w=64)
+        sparse_motion = self.create_sparse_motions(feature, kp_driving, kp_source)  # (bs, (1+num_kp)*3, d, h, w) - 5D
+        deformed_feature = self.create_deformed_feature(feature, sparse_motion)  # (bs, (1+num_kp)*c, d, h, w) - 5D
 
-        # 2. (bs, 1+num_kp, d, h, w)
-        heatmap = self.create_heatmap_representations(deformed_feature, kp_driving, kp_source)  # (bs, 1+num_kp, 1, d, h, w)
+        # 2. Create heatmap representations
+        heatmap = self.create_heatmap_representations(deformed_feature, kp_driving, kp_source)  # (bs, 1+num_kp, d, h, w) - 5D
 
-        input = torch.cat([heatmap, deformed_feature], dim=2)  # (bs, 1+num_kp, c=5, d=16, h=64, w=64)
-        input = input.view(bs, -1, d, h, w)  # (bs, (1+num_kp)*c=105, d=16, h=64, w=64)
+        # Prepare input by processing each keypoint+background separately to avoid 6D tensors
+        c = deformed_feature.shape[1] // (self.num_kp + 1)  # channels per keypoint
+        input_list = []
+
+        for i in range(self.num_kp + 1):
+            # Extract heatmap and deformed feature for this keypoint/background
+            heatmap_i = heatmap[:, i:i+1, :, :, :]  # (bs, 1, d, h, w) - 5D
+            deformed_i = deformed_feature[:, i*c:(i+1)*c, :, :, :]  # (bs, c, d, h, w) - 5D
+            # Concatenate: (bs, 1+c, d, h, w) - 5D
+            input_i = torch.cat([heatmap_i, deformed_i], dim=1)
+            input_list.append(input_i)
+
+        # Concatenate all: (bs, (1+num_kp)*(c+1), d, h, w) - 5D
+        input = torch.cat(input_list, dim=1)
 
         prediction = self.hourglass(input)
 
         mask = self.mask(prediction)
-        mask = F.softmax(mask, dim=1)  # (bs, 1+num_kp, d=16, h=64, w=64)
+        mask = F.softmax(mask, dim=1)  # (bs, 1+num_kp, d=16, h=64, w=64) - 5D
         out_dict['mask'] = mask
-        mask = mask.unsqueeze(2)                                   # (bs, num_kp+1, 1, d, h, w)
-        sparse_motion = sparse_motion.permute(0, 1, 5, 2, 3, 4)    # (bs, num_kp+1, 3, d, h, w)
-        deformation = (sparse_motion * mask).sum(dim=1)            # (bs, 3, d, h, w)  mask take effect in this place
-        deformation = deformation.permute(0, 2, 3, 4, 1)           # (bs, d, h, w, 3)
+
+        # Calculate deformation by processing each component separately
+        deformation_components = []
+        for i in range(self.num_kp + 1):
+            # Extract motion and mask for this component
+            motion_i = sparse_motion[:, i*3:(i+1)*3, :, :, :]  # (bs, 3, d, h, w) - 5D
+            mask_i = mask[:, i:i+1, :, :, :]  # (bs, 1, d, h, w) - 5D
+            # Multiply: (bs, 3, d, h, w) - 5D
+            weighted_motion_i = motion_i * mask_i
+            deformation_components.append(weighted_motion_i)
+
+        # Sum all components: (bs, 3, d, h, w) - 5D
+        deformation_temp = sum(deformation_components)
+        deformation = deformation_temp.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
 
         out_dict['deformation'] = deformation
 
         if self.flag_estimate_occlusion_map:
             bs, _, d, h, w = prediction.shape
-            prediction_reshape = prediction.view(bs, -1, h, w)
-            occlusion_map = torch.sigmoid(self.occlusion(prediction_reshape))  # Bx1x64x64
+            prediction_reshape = prediction.view(bs, -1, h, w)  # (bs, channels*d, h, w) - 4D
+            occlusion_map = torch.sigmoid(self.occlusion(prediction_reshape))  # (bs, 1, h, w) - 4D
             out_dict['occlusion_map'] = occlusion_map
 
         return out_dict
