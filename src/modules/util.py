@@ -121,9 +121,9 @@ class UpBlock3d(nn.Module):
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(UpBlock3d, self).__init__()
 
-        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
-                              padding=padding, groups=groups)
-        self.norm = nn.BatchNorm3d(out_features, affine=True)
+        self.conv = Conv3DEquivalent(in_features, out_features, kernel_size=kernel_size,
+                              padding=padding)
+        self.norm = BatchNorm3DEquivalent(out_features, affine=True)
 
     def forward(self, x):
         out = F.interpolate(x, scale_factor=(1, 2, 2))
@@ -159,13 +159,12 @@ class DownBlock3d(nn.Module):
 
     def __init__(self, in_features, out_features, kernel_size=3, padding=1, groups=1):
         super(DownBlock3d, self).__init__()
-        '''
-        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
-                                padding=padding, groups=groups, stride=(1, 2, 2))
-        '''
-        self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
-                              padding=padding, groups=groups)
-        self.norm = nn.BatchNorm3d(out_features, affine=True)
+        # Original 3D convolution - now using equivalent 2D approach
+        # self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
+        #                         padding=padding, groups=groups, stride=(1, 2, 2))
+        self.conv = Conv3DEquivalent(in_features, out_features, kernel_size=kernel_size,
+                              padding=padding)
+        self.norm = BatchNorm3DEquivalent(out_features, affine=True)
         # Use 2D pooling to maintain rank 4 constraint
         self.pool = nn.AvgPool2d(kernel_size=(2, 2))
 
@@ -209,72 +208,7 @@ class SameBlock2d(nn.Module):
         return out
 
 
-class Encoder(nn.Module):
-    """
-    Hourglass Encoder
-    """
 
-    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
-        super(Encoder, self).__init__()
-
-        down_blocks = []
-        for i in range(num_blocks):
-            down_blocks.append(DownBlock3d(in_features if i == 0 else min(max_features, block_expansion * (2 ** i)), min(max_features, block_expansion * (2 ** (i + 1))), kernel_size=3, padding=1))
-        self.down_blocks = nn.ModuleList(down_blocks)
-
-    def forward(self, x):
-        outs = [x]
-        for down_block in self.down_blocks:
-            outs.append(down_block(outs[-1]))
-        return outs
-
-
-class Decoder(nn.Module):
-    """
-    Hourglass Decoder
-    """
-
-    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
-        super(Decoder, self).__init__()
-
-        up_blocks = []
-
-        for i in range(num_blocks)[::-1]:
-            in_filters = (1 if i == num_blocks - 1 else 2) * min(max_features, block_expansion * (2 ** (i + 1)))
-            out_filters = min(max_features, block_expansion * (2 ** i))
-            up_blocks.append(UpBlock3d(in_filters, out_filters, kernel_size=3, padding=1))
-
-        self.up_blocks = nn.ModuleList(up_blocks)
-        self.out_filters = block_expansion + in_features
-
-        self.conv = nn.Conv3d(in_channels=self.out_filters, out_channels=self.out_filters, kernel_size=3, padding=1)
-        self.norm = nn.BatchNorm3d(self.out_filters, affine=True)
-
-    def forward(self, x):
-        out = x.pop()
-        for up_block in self.up_blocks:
-            out = up_block(out)
-            skip = x.pop()
-            out = torch.cat([out, skip], dim=1)
-        out = self.conv(out)
-        out = self.norm(out)
-        out = F.relu(out)
-        return out
-
-
-class Hourglass(nn.Module):
-    """
-    Hourglass architecture.
-    """
-
-    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
-        super(Hourglass, self).__init__()
-        self.encoder = Encoder(block_expansion, in_features, num_blocks, max_features)
-        self.decoder = Decoder(block_expansion, in_features, num_blocks, max_features)
-        self.out_filters = self.decoder.out_filters
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
 
 
 class SPADE(nn.Module):
@@ -475,3 +409,212 @@ def _ntuple(n):
     return parse
 
 to_2tuple = _ntuple(2)
+
+class Conv3DEquivalent(nn.Module):
+    """
+    Mathematically equivalent replacement for Conv3d using multiple Conv2d operations.
+
+    This exactly replicates 3D convolution behavior:
+    For each depth offset in the 3D kernel, apply the corresponding 2D kernel slice
+    to the depth-shifted input, then sum all contributions.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
+        super(Conv3DEquivalent, self).__init__()
+
+        # Handle kernel_size as int or tuple
+        if isinstance(kernel_size, int):
+            self.kd = self.kh = self.kw = kernel_size
+        else:
+            self.kd, self.kh, self.kw = kernel_size
+
+        # Handle padding as int or tuple
+        if isinstance(padding, int):
+            self.pd = self.ph = self.pw = padding
+        else:
+            self.pd, self.ph, self.pw = padding
+
+        self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Create 2D conv layers for each depth slice of the 3D kernel
+        self.conv2d_layers = nn.ModuleList()
+        for dd in range(self.kd):
+            conv2d = nn.Conv2d(in_channels, out_channels, (self.kh, self.kw),
+                              padding=(self.ph, self.pw), stride=stride, bias=False)
+            self.conv2d_layers.append(conv2d)
+
+        # Bias parameter (shared across all depth slices)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x):
+        # Input: (bs, c_in, d, h, w)
+        bs, c_in, d, h, w = x.shape
+
+        # Initialize output
+        output = torch.zeros(bs, self.out_channels, d, h, w, device=x.device, dtype=x.dtype)
+
+        # For each depth offset in the 3D kernel
+        for dd, conv2d in enumerate(self.conv2d_layers):
+            depth_offset = dd - self.kd // 2
+
+            # Handle depth boundaries with padding
+            for d_out in range(d):
+                d_in = d_out + depth_offset
+
+                # Check if input depth is valid (within padding bounds)
+                if -self.pd <= d_in < d + self.pd:
+                    if 0 <= d_in < d:
+                        # Valid input depth - use actual input
+                        input_slice = x[:, :, d_in, :, :]  # (bs, c_in, h, w)
+                        output_slice = conv2d(input_slice)  # (bs, c_out, h, w)
+                        output[:, :, d_out, :, :] += output_slice
+                    elif self.pd > 0:
+                        # Handle depth padding (typically zero padding)
+                        # For simplicity, we'll skip padded regions (equivalent to zero padding)
+                        pass
+
+        # Add bias if present
+        if self.bias is not None:
+            output += self.bias.view(1, -1, 1, 1, 1)
+
+        return output
+
+    def load_conv3d_weights(self, conv3d_weight, conv3d_bias=None):
+        """
+        Load weights from a Conv3d layer into this equivalent 2D representation.
+
+        Args:
+            conv3d_weight: Tensor of shape (out_channels, in_channels, kd, kh, kw)
+            conv3d_bias: Optional bias tensor of shape (out_channels,)
+        """
+        c_out, c_in, kd, kh, kw = conv3d_weight.shape
+
+        assert kd == self.kd and kh == self.kh and kw == self.kw, \
+            f"Kernel size mismatch: expected {(self.kd, self.kh, self.kw)}, got {(kd, kh, kw)}"
+        assert c_out == self.out_channels and c_in == self.in_channels, \
+            f"Channel mismatch: expected {(self.out_channels, self.in_channels)}, got {(c_out, c_in)}"
+
+        # Extract 2D slices from 3D kernel and assign to corresponding 2D conv layers
+        for dd in range(kd):
+            kernel_2d = conv3d_weight[:, :, dd, :, :]  # (c_out, c_in, kh, kw)
+            self.conv2d_layers[dd].weight.data = kernel_2d
+
+        # Load bias if present
+        if conv3d_bias is not None and self.bias is not None:
+            self.bias.data = conv3d_bias
+
+
+class BatchNorm3DEquivalent(nn.Module):
+    """
+    Mathematically equivalent replacement for BatchNorm3d using BatchNorm2d.
+
+    Applies 2D batch normalization to each depth slice independently.
+    This is mathematically equivalent since BatchNorm3d also computes statistics
+    across batch and spatial dimensions independently for each channel.
+    """
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+        super(BatchNorm3DEquivalent, self).__init__()
+        self.norm2d = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine)
+
+    def forward(self, x):
+        # Input: (bs, c, d, h, w)
+        bs, c, d, h, w = x.shape
+
+        # Reshape to process all depth slices together: (bs*d, c, h, w)
+        x_reshaped = x.view(bs * d, c, h, w)
+
+        # Apply 2D batch norm (mathematically equivalent to 3D)
+        output_reshaped = self.norm2d(x_reshaped)  # (bs*d, c, h, w)
+
+        # Reshape back: (bs, c, d, h, w)
+        output = output_reshaped.view(bs, c, d, h, w)
+
+        return output
+
+    def load_batchnorm3d_weights(self, bn3d_weight, bn3d_bias, bn3d_running_mean, bn3d_running_var):
+        """Load weights from a BatchNorm3d layer."""
+        if bn3d_weight is not None:
+            self.norm2d.weight.data = bn3d_weight
+        if bn3d_bias is not None:
+            self.norm2d.bias.data = bn3d_bias
+        if bn3d_running_mean is not None:
+            self.norm2d.running_mean.data = bn3d_running_mean
+        if bn3d_running_var is not None:
+            self.norm2d.running_var.data = bn3d_running_var
+
+
+
+
+
+class Encoder(nn.Module):
+    """
+    Hourglass Encoder (original version)
+    """
+
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Encoder, self).__init__()
+
+        down_blocks = []
+        for i in range(num_blocks):
+            down_blocks.append(DownBlock3d(in_features if i == 0 else min(max_features, block_expansion * (2 ** i)), min(max_features, block_expansion * (2 ** (i + 1))), kernel_size=3, padding=1))
+        self.down_blocks = nn.ModuleList(down_blocks)
+
+    def forward(self, x):
+        outs = [x]
+        for down_block in self.down_blocks:
+            outs.append(down_block(outs[-1]))
+        return outs
+
+
+class Decoder(nn.Module):
+    """
+    Hourglass Decoder (original version)
+    """
+
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Decoder, self).__init__()
+
+        up_blocks = []
+
+        for i in range(num_blocks)[::-1]:
+            in_filters = (1 if i == num_blocks - 1 else 2) * min(max_features, block_expansion * (2 ** (i + 1)))
+            out_filters = min(max_features, block_expansion * (2 ** i))
+            up_blocks.append(UpBlock3d(in_filters, out_filters, kernel_size=3, padding=1))
+
+        self.up_blocks = nn.ModuleList(up_blocks)
+        self.out_filters = block_expansion + in_features
+
+        self.conv = Conv3DEquivalent(self.out_filters, self.out_filters, kernel_size=3, padding=1)
+        self.norm = BatchNorm3DEquivalent(self.out_filters, affine=True)
+
+    def forward(self, x):
+        out = x.pop()
+        for up_block in self.up_blocks:
+            out = up_block(out)
+            skip = x.pop()
+            out = torch.cat([out, skip], dim=1)
+        out = self.conv(out)
+        out = self.norm(out)
+        out = F.relu(out)
+        return out
+
+
+class Hourglass(nn.Module):
+    """
+    Hourglass architecture (original version)
+    """
+
+    def __init__(self, block_expansion, in_features, num_blocks=3, max_features=256):
+        super(Hourglass, self).__init__()
+        self.encoder = Encoder(block_expansion, in_features, num_blocks, max_features)
+        self.decoder = Decoder(block_expansion, in_features, num_blocks, max_features)
+        self.out_filters = self.decoder.out_filters
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))

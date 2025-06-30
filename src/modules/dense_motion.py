@@ -7,7 +7,7 @@ The module that predicting a dense motion from sparse motion representation give
 from torch import nn
 import torch.nn.functional as F
 import torch
-from .util import Hourglass, make_coordinate_grid, kp2gaussian
+from .util import Hourglass, Conv3DEquivalent, BatchNorm3DEquivalent, make_coordinate_grid, kp2gaussian
 
 
 class DenseMotionNetwork(nn.Module):
@@ -15,9 +15,9 @@ class DenseMotionNetwork(nn.Module):
         super(DenseMotionNetwork, self).__init__()
         self.hourglass = Hourglass(block_expansion=block_expansion, in_features=(num_kp+1)*(compress+1), max_features=max_features, num_blocks=num_blocks)  # ~60+G
 
-        self.mask = nn.Conv3d(self.hourglass.out_filters, num_kp + 1, kernel_size=7, padding=3)  # 65G! NOTE: computation cost is large
-        self.compress = nn.Conv3d(feature_channel, compress, kernel_size=1)  # 0.8G
-        self.norm = nn.BatchNorm3d(compress, affine=True)
+        self.mask = Conv3DEquivalent(self.hourglass.out_filters, num_kp + 1, kernel_size=7, padding=3)  # 65G! NOTE: computation cost is large
+        self.compress = Conv3DEquivalent(feature_channel, compress, kernel_size=1)  # 0.8G
+        self.norm = BatchNorm3DEquivalent(compress, affine=True)
         self.num_kp = num_kp
         self.flag_estimate_occlusion_map = estimate_occlusion_map
 
