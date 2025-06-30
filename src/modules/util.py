@@ -166,13 +166,25 @@ class DownBlock3d(nn.Module):
         self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
                               padding=padding, groups=groups)
         self.norm = nn.BatchNorm3d(out_features, affine=True)
-        self.pool = nn.AvgPool3d(kernel_size=(1, 2, 2))
+        # Use 2D pooling to maintain rank 4 constraint
+        self.pool = nn.AvgPool2d(kernel_size=(2, 2))
 
     def forward(self, x):
         out = self.conv(x)
         out = self.norm(out)
         out = F.relu(out)
-        out = self.pool(out)
+
+        # Reshape to 4D for 2D pooling: (bs, c, d, h, w) -> (bs*d, c, h, w)
+        bs, c, d, h, w = out.shape
+        out_reshaped = out.view(bs * d, c, h, w)  # (bs*d, c, h, w) - 4D
+
+        # Apply 2D pooling: (bs*d, c, h, w) -> (bs*d, c, h//2, w//2) - 4D
+        out_pooled = self.pool(out_reshaped)
+
+        # Reshape back to 5D: (bs*d, c, h//2, w//2) -> (bs, c, d, h//2, w//2)
+        _, _, h_new, w_new = out_pooled.shape
+        out = out_pooled.view(bs, c, d, h_new, w_new)  # (bs, c, d, h//2, w//2) - 5D
+
         return out
 
 
