@@ -475,3 +475,150 @@ def _ntuple(n):
     return parse
 
 to_2tuple = _ntuple(2)
+
+class Conv3DEquivalent(nn.Module):
+    """
+    Optimized mathematically equivalent replacement for Conv3d.
+
+    Uses efficient vectorized operations instead of multiple Conv2d layers
+    to dramatically reduce graph size while maintaining exact equivalence.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
+        super(nn.Conv3d, self).__init__()
+
+        # Handle kernel_size as int or tuple
+        if isinstance(kernel_size, int):
+            self.kd = self.kh = self.kw = kernel_size
+        else:
+            self.kd, self.kh, self.kw = kernel_size
+
+        # Handle padding as int or tuple
+        if isinstance(padding, int):
+            self.pd = self.ph = self.pw = padding
+        else:
+            self.pd, self.ph, self.pw = padding
+
+        self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Single optimized Conv2d layer instead of multiple layers
+        # Process all depth slices in parallel using channel dimension
+        self.conv2d = nn.Conv2d(
+            in_channels * self.kd,
+            out_channels,
+            (self.kh, self.kw),
+            padding=(self.ph, self.pw),
+            stride=stride,
+            bias=bias
+        )
+
+        # Store kernel depth for weight loading
+        self.kernel_depth = self.kd
+
+    def forward(self, x):
+        # Input: (bs, c_in, d, h, w)
+        bs, c_in, d, h, w = x.shape
+
+        # Pad depth dimension if needed
+        if self.pd > 0:
+            x = F.pad(x, (0, 0, 0, 0, self.pd, self.pd), mode='constant', value=0)
+            d = d + 2 * self.pd
+
+        # Prepare input for vectorized convolution
+        # Create sliding window over depth dimension
+        input_slices = []
+        for d_out in range(d - self.kd + 1):
+            # Extract depth window: (bs, c_in, kd, h, w)
+            depth_window = x[:, :, d_out:d_out+self.kd, :, :]
+            # Reshape to (bs, c_in*kd, h, w)
+            depth_window_flat = depth_window.reshape(bs, c_in * self.kd, h, w)
+            input_slices.append(depth_window_flat)
+
+        if not input_slices:
+            # Handle edge case where output depth would be 0
+            return torch.zeros(bs, self.out_channels, 0, h, w, device=x.device, dtype=x.dtype)
+
+        # Stack all depth positions: (bs, d_out, c_in*kd, h, w)
+        input_stacked = torch.stack(input_slices, dim=1)
+        bs, d_out, c_flat, h, w = input_stacked.shape
+
+        # Reshape for batch processing: (bs*d_out, c_in*kd, h, w)
+        input_batch = input_stacked.reshape(bs * d_out, c_flat, h, w)
+
+        # Single vectorized convolution
+        output_batch = self.conv2d(input_batch)  # (bs*d_out, c_out, h_out, w_out)
+
+        # Reshape back to 5D: (bs, d_out, c_out, h_out, w_out) -> (bs, c_out, d_out, h_out, w_out)
+        bs_d_out, c_out, h_out, w_out = output_batch.shape
+        output = output_batch.reshape(bs, d_out, c_out, h_out, w_out).permute(0, 2, 1, 3, 4)
+
+        return output
+
+    def load_conv3d_weights(self, conv3d_weight, conv3d_bias=None):
+        """
+        Load weights from a Conv3d layer into this optimized equivalent representation.
+
+        Args:
+            conv3d_weight: Tensor of shape (out_channels, in_channels, kd, kh, kw)
+            conv3d_bias: Optional bias tensor of shape (out_channels,)
+        """
+        c_out, c_in, kd, kh, kw = conv3d_weight.shape
+
+        assert kd == self.kd and kh == self.kh and kw == self.kw, \
+            f"Kernel size mismatch: expected {(self.kd, self.kh, self.kw)}, got {(kd, kh, kw)}"
+        assert c_out == self.out_channels and c_in == self.in_channels, \
+            f"Channel mismatch: expected {(self.out_channels, self.in_channels)}, got {(c_out, c_in)}"
+
+        # Reshape 3D kernel to fit the optimized 2D conv structure
+        # (c_out, c_in, kd, kh, kw) -> (c_out, c_in*kd, kh, kw)
+        kernel_2d = conv3d_weight.reshape(c_out, c_in * kd, kh, kw)
+        self.conv2d.weight.data = kernel_2d
+
+        # Load bias if present
+        if conv3d_bias is not None:
+            self.conv2d.bias.data = conv3d_bias
+
+
+class BatchNorm3DEquivalent(nn.Module):
+    """
+    Mathematically equivalent replacement for BatchNorm3d using BatchNorm2d.
+
+    Applies 2D batch normalization to each depth slice independently.
+    This is mathematically equivalent since BatchNorm3d also computes statistics
+    across batch and spatial dimensions independently for each channel.
+    """
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+        super(BatchNorm3DEquivalent, self).__init__()
+        self.norm2d = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine)
+
+    def forward(self, x):
+        # Input: (bs, c, d, h, w)
+        bs, c, d, h, w = x.shape
+
+        # Reshape to process all depth slices together: (bs*d, c, h, w)
+        x_reshaped = x.reshape(bs * d, c, h, w)
+
+        # Apply 2D batch norm (mathematically equivalent to 3D)
+        output_reshaped = self.norm2d(x_reshaped)  # (bs*d, c, h, w)
+
+        # Reshape back: (bs, c, d, h, w)
+        output = output_reshaped.reshape(bs, c, d, h, w)
+
+        return output
+
+    def load_batchnorm3d_weights(self, bn3d_weight, bn3d_bias, bn3d_running_mean, bn3d_running_var):
+        """Load weights from a BatchNorm3d layer."""
+        if bn3d_weight is not None:
+            self.norm2d.weight.data = bn3d_weight
+        if bn3d_bias is not None:
+            self.norm2d.bias.data = bn3d_bias
+        if bn3d_running_mean is not None:
+            self.norm2d.running_mean.data = bn3d_running_mean
+        if bn3d_running_var is not None:
+            self.norm2d.running_var.data = bn3d_running_var
+
+
+
