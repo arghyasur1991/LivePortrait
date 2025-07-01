@@ -518,22 +518,31 @@ class Conv3DEquivalent(nn.Module):
             x = torch.cat((pad_tensor, x, pad_tensor), dim=2)
             d = x.shape[2]  # Recalculate depth after padding
 
-        # Manually create sliding windows over the depth dimension without using unfold
-        # This is a replacement for `x.unfold(2, self.kd, 1)`
-        input_slices = [x[:, :, i:i + self.kd, :, :] for i in range(d - self.kd + 1)]
-        x_stacked = torch.stack(input_slices, dim=2)
+        # Calculate output depth
+        d_out = d - self.kd + 1
 
-        # Reshape for 2D convolution
-        # (bs, c_in, d_out, kd, h, w) -> (bs * d_out, c_in * kd, h, w)
-        d_out = x_stacked.shape[2]
-        x_reshaped = x_stacked.permute(0, 2, 1, 3, 4, 5).reshape(bs * d_out, c_in * self.kd, h, w)
+        # Manually create sliding windows and directly reshape to avoid >5D tensors
+        # Instead of stacking to 6D, we'll collect reshaped slices directly
+        input_slices_reshaped = []
+        for i in range(d_out):
+            # Extract slice: (bs, c_in, kd, h, w) - stays 5D
+            slice_i = x[:, :, i:i + self.kd, :, :]
+            # Reshape to 4D for conv2d: (bs, c_in * kd, h, w)
+            slice_reshaped = slice_i.reshape(bs, c_in * self.kd, h, w)
+            input_slices_reshaped.append(slice_reshaped)
+
+        # Stack the 4D slices to get (d_out, bs, c_in * kd, h, w) - 5D
+        x_stacked = torch.stack(input_slices_reshaped, dim=0)
+
+        # Reshape for batch processing: (d_out * bs, c_in * kd, h, w) - 4D
+        x_reshaped = x_stacked.reshape(d_out * bs, c_in * self.kd, h, w)
 
         # Apply the 2D convolution
         conv_out = self.conv2d(x_reshaped)
         _, c_out, h_out, w_out = conv_out.shape
 
-        # Reshape the output back to 5D
-        output = conv_out.reshape(bs, d_out, c_out, h_out, w_out).permute(0, 2, 1, 3, 4)
+        # Reshape the output back to 5D: (d_out, bs, c_out, h_out, w_out) -> (bs, c_out, d_out, h_out, w_out)
+        output = conv_out.reshape(d_out, bs, c_out, h_out, w_out).permute(1, 2, 0, 3, 4)
 
         return output
 
