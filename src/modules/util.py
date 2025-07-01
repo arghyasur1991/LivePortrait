@@ -99,8 +99,8 @@ class ResBlock3d(nn.Module):
         super(ResBlock3d, self).__init__()
         self.conv1 = Conv3DEquivalent(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size, padding=padding)
         self.conv2 = Conv3DEquivalent(in_channels=in_features, out_channels=in_features, kernel_size=kernel_size, padding=padding)
-        self.norm1 = nn.BatchNorm3d(in_features, affine=True)
-        self.norm2 = nn.BatchNorm3d(in_features, affine=True)
+        self.norm1 = BatchNorm3DEquivalent(in_features, affine=True)
+        self.norm2 = BatchNorm3DEquivalent(in_features, affine=True)
 
     def forward(self, x):
         out = self.norm1(x)
