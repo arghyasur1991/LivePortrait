@@ -261,9 +261,10 @@ def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"
         model_simp, check = simplify(model)
 
         # Remove problematic Cast nodes on inputs for specific models
-        if model_type == "spade":
-            print("🔧 Applying Cast node removal for spade model...")
-            model_simp = remove_cast_nodes_on_inputs(model_simp)
+        # Disable this for now, Keep it commented for future
+        # if model_type == "spade":
+        #     print("🔧 Applying Cast node removal for spade model...")
+        #     model_simp = remove_cast_nodes_on_inputs(model_simp)
 
         # Save original model as backup
         shutil.copy(fp16_model_path, fp16_model_path + ".original")
