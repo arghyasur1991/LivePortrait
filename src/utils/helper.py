@@ -129,51 +129,6 @@ def remove_ddp_dumplicate_key(state_dict):
         state_dict_new[key.replace('module.', '')] = state_dict[key]
     return state_dict_new
 
-
-def load_equivalent_weights(module, state_dict, prefix=""):
-    """
-    Load 3D checkpoint weights into equivalent 2D architecture.
-
-    Args:
-        module: The module to load weights into
-        state_dict: The checkpoint state dict
-        prefix: The prefix for keys in this module
-    """
-    from ..modules.util import Conv3DEquivalent, BatchNorm3DEquivalent
-
-    # Handle nn.Conv3d layers
-    # if isinstance(module, nn.Conv3d):
-    #     conv_key = prefix + "weight"
-    #     bias_key = prefix + "bias"
-
-    #     if conv_key in state_dict:
-    #         conv3d_weight = state_dict[conv_key]
-    #         conv3d_bias = state_dict.get(bias_key, None)
-    #         module.load_conv3d_weights(conv3d_weight, conv3d_bias)
-    #         return
-
-    # Handle BatchNorm3DEquivalent layers
-    if isinstance(module, BatchNorm3DEquivalent):
-        weight_key = prefix + "weight"
-        bias_key = prefix + "bias"
-        running_mean_key = prefix + "running_mean"
-        running_var_key = prefix + "running_var"
-
-        if weight_key in state_dict:
-            module.load_batchnorm3d_weights(
-                state_dict.get(weight_key, None),
-                state_dict.get(bias_key, None),
-                state_dict.get(running_mean_key, None),
-                state_dict.get(running_var_key, None)
-            )
-            return
-
-    # Recursively handle child modules
-    for name, child in module.named_children():
-        child_prefix = prefix + name + "."
-        load_equivalent_weights(child, state_dict, child_prefix)
-
-
 def load_model(ckpt_path, model_config, device, model_type):
     """
     Load model from checkpoint.
@@ -193,11 +148,6 @@ def load_model(ckpt_path, model_config, device, model_type):
         model = MotionExtractor(**model_params).to(device)
     elif model_type == 'warping_module':
         model = WarpingNetwork(**model_params).to(device)
-        # Special handling for warping module with equivalent 2D operations
-        # checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
-        # load_equivalent_weights(model, checkpoint)
-        # model.eval()
-        # return model
     elif model_type == 'spade_generator':
         model = SPADEDecoder(**model_params).to(device)
     elif model_type == 'stitching_retargeting_module':
