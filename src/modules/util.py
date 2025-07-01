@@ -609,133 +609,62 @@ class BatchNorm3DEquivalent(nn.Module):
 
 class GridSample3DEquivalent(nn.Module):
     """
-    Mathematically equivalent replacement for F.grid_sample with 5D tensors.
-
-    Decomposes 3D grid sampling into multiple 2D grid sampling operations
-    applied to each depth slice, maintaining exact mathematical equivalence
-    while using only 2D operations for better ONNX compatibility.
+    Equivalent implementation of 3D grid_sample using 2D grid_sample.
+    It decomposes trilinear interpolation into a series of bilinear
+    interpolations (via 2D grid_sample) and a final linear interpolation.
+    NOTE: This implementation may create intermediate 6D tensor views, which might
+    not be supported by all ONNX runtimes. It is, however, mathematically
+    equivalent to F.grid_sample with mode='bilinear'.
     """
-
-    def __init__(self, mode='bilinear', padding_mode='zeros', align_corners=None):
-        super(GridSample3DEquivalent, self).__init__()
-        self.mode = mode
+    def __init__(self, padding_mode='zeros', align_corners=False):
+        super().__init__()
         self.padding_mode = padding_mode
         self.align_corners = align_corners
 
     def forward(self, input_tensor, grid):
-        """
-        Args:
-            input_tensor: Input tensor of shape (N, C, D, H, W)
-            grid: Grid tensor of shape (N, D_out, H_out, W_out, 3)
-                  where grid[..., :] contains (x, y, z) coordinates
+        # input_tensor: (N, C, D_in, H_in, W_in)
+        # grid: (N, D_out, H_out, W_out, 3) -> (x, y, z) coords
+        N, C, D_in, H_in, W_in = input_tensor.shape
+        _, D_out, H_out, W_out, _ = grid.shape
 
-        Returns:
-            Output tensor of shape (N, C, D_out, H_out, W_out)
-        """
-        N, C, D, H, W = input_tensor.shape
-        N_grid, D_out, H_out, W_out, _ = grid.shape
+        # --- Step 1: Bilinearly sample all input depth slices ---
+        input_reshaped = input_tensor.permute(0, 2, 1, 3, 4).reshape(N * D_in, C, H_in, W_in)
 
-        assert N == N_grid, f"Batch size mismatch: input {N} vs grid {N_grid}"
+        grid_xy = grid[..., :2]
+        grid_tiled = grid_xy.unsqueeze(1).repeat(1, D_in, 1, 1, 1, 1).view(N * D_in, D_out, H_out, W_out, 2)
 
-        # Extract z coordinates and convert to depth indices
-        # grid[..., 2] contains z coordinates in [-1, 1] range
-        z_coords = grid[..., 2]  # (N, D_out, H_out, W_out)
+        sampled_all_depths = F.grid_sample(
+            input_reshaped,
+            grid_tiled,
+            mode='bilinear',
+            padding_mode=self.padding_mode,
+            align_corners=self.align_corners
+        )
 
-        # Convert z coordinates from [-1, 1] to [0, D-1] range
-        z_indices = (z_coords + 1) * (D - 1) / 2  # (N, D_out, H_out, W_out)
+        # --- Step 2: Prepare for linear interpolation along depth ---
+        s_view = sampled_all_depths.view(N, D_in, C, D_out, H_out, W_out)
+        s_permuted = s_view.permute(0, 2, 3, 4, 5, 1)
 
-        # Get xy coordinates for 2D sampling
-        xy_grid = grid[..., :2]  # (N, D_out, H_out, W_out, 2)
+        grid_z = grid[..., 2]
+        if self.align_corners:
+            z_unnormalized = (grid_z + 1) / 2 * (D_in - 1)
+        else:
+            z_unnormalized = ((grid_z + 1) * D_in - 1) / 2
 
-        # Handle different interpolation modes for depth
-        if self.mode == 'nearest':
-            # Nearest neighbor interpolation in depth
-            z_indices_rounded = torch.round(z_indices).long()
-            z_indices_rounded = torch.clamp(z_indices_rounded, 0, D - 1)
+        z_floor = torch.floor(z_unnormalized)
+        z_ceil = z_floor + 1
+        z_weight = (z_unnormalized - z_floor).unsqueeze(1)
 
-            # Sample from the nearest depth slice
-            output_slices = []
-            for n in range(N):
-                batch_output = []
-                for d_out in range(D_out):
-                    for h_out in range(H_out):
-                        for w_out in range(W_out):
-                            z_idx = z_indices_rounded[n, d_out, h_out, w_out]
-                            # Extract the depth slice: (C, H, W)
-                            depth_slice = input_tensor[n, :, z_idx, :, :]
-                            # Sample using 2D grid sampling
-                            xy_coord = xy_grid[n, d_out:d_out+1, h_out:h_out+1, w_out:w_out+1, :]
-                            sampled = F.grid_sample(
-                                depth_slice.unsqueeze(0),  # (1, C, H, W)
-                                xy_coord,  # (1, 1, 1, 2)
-                                mode=self.mode,
-                                padding_mode=self.padding_mode,
-                                align_corners=self.align_corners
-                            )
-                            batch_output.append(sampled.squeeze())
-                output_slices.append(torch.stack(batch_output).reshape(D_out, H_out, W_out, C).permute(3, 0, 1, 2))
+        z_floor = z_floor.long().clamp(0, D_in - 1)
+        z_ceil = z_ceil.long().clamp(0, D_in - 1)
 
-            output = torch.stack(output_slices, dim=0)
+        # --- Step 3: Gather floor/ceil values and interpolate ---
+        def prepare_index(idx):
+            idx = idx.unsqueeze(1).unsqueeze(-1)
+            return idx.expand(-1, C, -1, -1, -1, -1)
 
-        else:  # bilinear or bicubic
-            # Linear interpolation in depth dimension
-            z_floor = torch.floor(z_indices).long()
-            z_ceil = z_floor + 1
-            z_floor = torch.clamp(z_floor, 0, D - 1)
-            z_ceil = torch.clamp(z_ceil, 0, D - 1)
+        floor_vals = s_permuted.gather(dim=5, index=prepare_index(z_floor)).squeeze(-1)
+        ceil_vals = s_permuted.gather(dim=5, index=prepare_index(z_ceil)).squeeze(-1)
 
-            # Interpolation weights
-            z_weight = z_indices - z_floor.float()
-
-            # Sample from floor and ceil depth slices
-            output_list = []
-            for n in range(N):
-                # Process each sample in the batch
-                floor_samples = []
-                ceil_samples = []
-
-                # Collect unique depth indices for this batch item
-                unique_floor = torch.unique(z_floor[n])
-                unique_ceil = torch.unique(z_ceil[n])
-                unique_depths = torch.unique(torch.cat([unique_floor, unique_ceil]))
-
-                # Pre-sample all needed depth slices
-                depth_samples = {}
-                for z_idx in unique_depths:
-                    if 0 <= z_idx < D:
-                        depth_slice = input_tensor[n:n+1, :, z_idx, :, :]  # (1, C, H, W)
-                        # Sample entire xy grid for this depth
-                        sampled = F.grid_sample(
-                            depth_slice,
-                            xy_grid[n:n+1, :, :, :, :],  # (1, D_out, H_out, W_out, 2)
-                            mode=self.mode,
-                            padding_mode=self.padding_mode,
-                            align_corners=self.align_corners
-                        )
-                        depth_samples[z_idx.item()] = sampled.squeeze(0)  # (C, D_out, H_out, W_out)
-
-                # Interpolate between floor and ceil samples
-                batch_output = torch.zeros(C, D_out, H_out, W_out, device=input_tensor.device, dtype=input_tensor.dtype)
-
-                for d_out in range(D_out):
-                    for h_out in range(H_out):
-                        for w_out in range(W_out):
-                            z_f = z_floor[n, d_out, h_out, w_out].item()
-                            z_c = z_ceil[n, d_out, h_out, w_out].item()
-                            weight = z_weight[n, d_out, h_out, w_out]
-
-                            floor_val = depth_samples.get(z_f, torch.zeros(C, device=input_tensor.device, dtype=input_tensor.dtype))
-                            ceil_val = depth_samples.get(z_c, torch.zeros(C, device=input_tensor.device, dtype=input_tensor.dtype))
-
-                            if floor_val.dim() > 1:
-                                floor_val = floor_val[:, d_out, h_out, w_out]
-                            if ceil_val.dim() > 1:
-                                ceil_val = ceil_val[:, d_out, h_out, w_out]
-
-                            batch_output[:, d_out, h_out, w_out] = (1 - weight) * floor_val + weight * ceil_val
-
-                output_list.append(batch_output)
-
-            output = torch.stack(output_list, dim=0)
-
+        output = (1 - z_weight) * floor_vals + z_weight * ceil_vals
         return output
