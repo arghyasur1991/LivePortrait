@@ -85,6 +85,22 @@ class MotionExtractorWrapper(nn.Module):
             output_dict['kp']
         )
 
+class AppearanceFeatureExtractorWrapper(nn.Module):
+    """
+    Wrapper for appearance_feature_extractor export from PyTorch
+    """
+
+    def __init__(self, appearance_feature_extractor):
+        super().__init__()
+        self.appearance_feature_extractor = appearance_feature_extractor
+
+    def forward(self, img):
+        """
+        Forward pass for appearance feature extractor
+        Returns the 3D feature volume
+        """
+        return self.appearance_feature_extractor(img)
+
 def adjust_reshape_nodes(model):
     """Adjust reshape nodes if rank > 5 to lower ranks"""
     for node in model.graph.node:
@@ -219,6 +235,84 @@ def export_motion_extractor_from_pytorch(output_path):
             do_constant_folding=True,
             input_names=['img'],
             output_names=['pitch', 'yaw', 'roll', 't', 'exp', 'scale', 'kp'],
+            # Fixed shapes for maximum optimization - no dynamic axes
+        )
+
+        print(f"✅ PyTorch export successful")
+
+        # Optimize the exported model
+        model = onnx.load(output_path)
+        onnx.checker.check_model(model)
+
+        print(f"🔧 Optimizing exported model...")
+        model_simp, check = simplify(
+            model,
+            check_n=5,
+            perform_optimization=True,
+            overwrite_input_shapes={
+                'img': [1, 3, 256, 256]
+            }
+        )
+
+        model_opt = adjust_reshape_nodes(model_simp)
+
+        if check:
+            onnx.save(model_simp, output_path)
+            print(f"✅ PyTorch export and optimization complete")
+            print(f"📊 Final model: {len(model_simp.graph.node)} nodes")
+            return True
+        else:
+            print(f"❌ Optimization failed")
+            return False
+
+    except Exception as e:
+        print(f"❌ PyTorch export failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def export_appearance_feature_extractor_from_pytorch(output_path):
+    """Export appearance_feature_extractor directly from PyTorch modules"""
+    print(f"🔧 Exporting appearance_feature_extractor from PyTorch modules...")
+
+    try:
+        from src.config.inference_config import InferenceConfig
+        from src.live_portrait_wrapper import LivePortraitWrapper
+
+        # Load PyTorch modules
+        cfg = InferenceConfig()
+        cfg.flag_force_cpu = True
+        wrapper = LivePortraitWrapper(inference_cfg=cfg)
+
+        print("✅ PyTorch modules loaded")
+
+        # Create appearance feature extractor wrapper
+        pytorch_wrapper = AppearanceFeatureExtractorWrapper(
+            appearance_feature_extractor=wrapper.appearance_feature_extractor
+        )
+
+        pytorch_wrapper.eval()
+
+        # Fixed input shapes for maximum optimization
+        with torch.no_grad():
+            img = torch.randn(1, 3, 256, 256)  # Standard input size for appearance feature extractor
+
+            # Test
+            test_output = pytorch_wrapper(img)
+            print(f"✅ Test output shape: {test_output.shape}")
+
+        # Export to ONNX
+        sample_inputs = (img,)
+
+        torch.onnx.export(
+            pytorch_wrapper,
+            sample_inputs,
+            output_path,
+            export_params=True,
+            opset_version=20,
+            do_constant_folding=True,
+            input_names=['img'],
+            output_names=['out'],
             # Fixed shapes for maximum optimization - no dynamic axes
         )
 
@@ -661,6 +755,13 @@ def process_model_with_precisions(input_path, base_path, model_name, model_type,
                 else:
                     print(f"❌ PyTorch export failed")
                     return 0
+            elif from_pytorch and model_name == "appearance_feature_extractor":
+                print(f"🔧 Exporting {model_name} from PyTorch modules...")
+                if export_appearance_feature_extractor_from_pytorch(fp32_path):
+                    print(f"✅ PyTorch export successful")
+                else:
+                    print(f"❌ PyTorch export failed")
+                    return 0
             else:
                 # Use existing ONNX processing
                 if not process_existing_onnx_model(input_path, fp32_path, model_name, model_type):
@@ -721,7 +822,7 @@ def main():
     parser.add_argument("--precision", choices=["all", "fp32", "fp16", "floating", "int8"],
                        default="floating", help="Precision to export: all (fp32+fp16+int8), fp32, fp16, floating (fp32+fp16), int8")
     parser.add_argument("--from-pytorch", action="store_true",
-                       help="Export warping_spade and motion_extractor from PyTorch modules instead of existing ONNX")
+                       help="Export warping_spade, motion_extractor, and appearance_feature_extractor from PyTorch modules instead of existing ONNX")
 
     args = parser.parse_args()
 
@@ -743,7 +844,7 @@ def main():
 
     # Print PyTorch export info
     if getattr(args, 'from_pytorch', False):
-        print(f"🔧 PyTorch export enabled for warping_spade and motion_extractor")
+        print(f"🔧 PyTorch export enabled for warping_spade, motion_extractor, and appearance_feature_extractor")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -814,7 +915,7 @@ def main():
             output_path = output_dir / f"{model_name}.onnx"
 
             # For PyTorch export, we don't need the input file to exist
-            if getattr(args, 'from_pytorch', False) and model_name in ["warping_spade", "motion_extractor"]:
+            if getattr(args, 'from_pytorch', False) and model_name in ["warping_spade", "motion_extractor", "appearance_feature_extractor"]:
                 print(f"🔧 Will export {model_name} from PyTorch modules")
             elif not input_path.exists():
                 print(f"⚠️ Model file not found: {input_path}")
