@@ -73,7 +73,7 @@ class DenseMotionNetwork(nn.Module):
             end_idx = 3 + (kp_idx + 1) * 3
             kp_motion = sparse_motions[:, start_idx:end_idx, :, :, :]  # (bs, 3, d, h, w) - 5D
             kp_motion_for_sample = kp_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
-            kp_deformed = self.grid_sample(feature, kp_motion_for_sample)
+            kp_deformed = F.grid_sample(feature, kp_motion_for_sample, align_corners=False)
             deformed_features_list.append(kp_deformed)
 
         # Concatenate all deformed features: (bs, (num_kp+1)*c, d, h, w) - 5D
