@@ -17,7 +17,7 @@ class DenseMotionNetwork(nn.Module):
 
         self.mask = nn.Conv3d(self.hourglass.out_filters, num_kp + 1, kernel_size=7, padding=3)  # 65G! NOTE: computation cost is large
         self.compress = nn.Conv3d(feature_channel, compress, kernel_size=1)  # 0.8G
-        self.norm = BatchNorm3DEquivalent(compress, affine=True)
+        self.norm = nn.BatchNorm3d(compress, affine=True)
         self.num_kp = num_kp
         self.flag_estimate_occlusion_map = estimate_occlusion_map
 

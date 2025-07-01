@@ -194,10 +194,10 @@ def load_model(ckpt_path, model_config, device, model_type):
     elif model_type == 'warping_module':
         model = WarpingNetwork(**model_params).to(device)
         # Special handling for warping module with equivalent 2D operations
-        checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
-        load_equivalent_weights(model, checkpoint)
-        model.eval()
-        return model
+        # checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+        # load_equivalent_weights(model, checkpoint)
+        # model.eval()
+        # return model
     elif model_type == 'spade_generator':
         model = SPADEDecoder(**model_params).to(device)
     elif model_type == 'stitching_retargeting_module':
