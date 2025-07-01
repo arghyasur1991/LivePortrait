@@ -7,35 +7,8 @@ keypoint representations x_s and x_d, and employs this flow field to warp the so
 
 from torch import nn
 import torch.nn.functional as F
-from .util import (
-    Hourglass, kp2gaussian, make_coordinate_grid, AntiAliasInterpolation2d,
-    ResBlock3d, UpBlock3d, SameBlock2d, DownBlock3d,
-    GridSample3DEquivalent
-)
+from .util import SameBlock2d
 from .dense_motion import DenseMotionNetwork
-
-
-def deform_input(inp, deformation):
-    bs, d_in, h_in, w_in, _ = deformation.shape
-    _, _, d, h, w = inp.shape
-
-    if d_in != d or h_in != h or w_in != w:
-        # Create a grid for the target size to resample the deformation field
-        identity_grid = make_coordinate_grid((d, h, w), ref=inp).view(1, d, h, w, 3)
-        identity_grid = identity_grid.repeat(bs, 1, 1, 1, 1)
-
-        # Reshape deformation to be a (N, C, D, H, W) tensor for sampling
-        deformation_as_input = deformation.permute(0, 4, 1, 2, 3)
-
-        # Use our ONNX-safe grid_sample to resize the deformation field
-        resized_deformation = GridSample3DEquivalent(align_corners=False)(
-            deformation_as_input, identity_grid
-        )
-
-        # Permute back to the original (N, D, H, W, C) format
-        deformation = resized_deformation.permute(0, 2, 3, 4, 1)
-
-    return GridSample3DEquivalent(align_corners=False)(inp, deformation)
 
 
 class WarpingNetwork(nn.Module):
@@ -70,6 +43,9 @@ class WarpingNetwork(nn.Module):
 
         self.estimate_occlusion_map = estimate_occlusion_map
 
+    def deform_input(self, inp, deformation):
+        return F.grid_sample(inp, deformation, align_corners=False)
+
     def forward(self, feature_3d, kp_driving, kp_source):
         if self.dense_motion_network is not None:
             # Feature warper, Transforming feature representation according to deformation and occlusion
@@ -82,7 +58,7 @@ class WarpingNetwork(nn.Module):
                 occlusion_map = None
 
             deformation = dense_motion['deformation']  # Bx16x64x64x3
-            out = deform_input(feature_3d, deformation)  # Bx32x16x64x64
+            out = self.deform_input(feature_3d, deformation)  # Bx32x16x64x64
 
             bs, c, d, h, w = out.shape  # Bx32x16x64x64
             out = out.view(bs, c * d, h, w)  # -> Bx512x64x64

@@ -7,7 +7,7 @@ The module that predicting a dense motion from sparse motion representation give
 from torch import nn
 import torch.nn.functional as F
 import torch
-from .util import Hourglass, Conv3DEquivalent, BatchNorm3DEquivalent, make_coordinate_grid, kp2gaussian, AntiAliasInterpolation2d, to_2tuple, GridSample3DEquivalent
+from .util import Hourglass, Conv3DEquivalent, BatchNorm3DEquivalent, make_coordinate_grid, kp2gaussian
 
 
 class DenseMotionNetwork(nn.Module):
@@ -25,8 +25,6 @@ class DenseMotionNetwork(nn.Module):
             self.occlusion = nn.Conv2d(self.hourglass.out_filters*reshape_depth, 1, kernel_size=7, padding=3)
         else:
             self.occlusion = None
-
-        self.grid_sample = GridSample3DEquivalent(align_corners=False)
 
     def create_sparse_motions(self, feature, kp_driving, kp_source):
         bs, _, d, h, w = feature.shape  # (bs, 4, 16, 64, 64)
@@ -65,7 +63,7 @@ class DenseMotionNetwork(nn.Module):
         # Background (identity) feature
         background_motion = sparse_motions[:, :3, :, :, :]  # (bs, 3, d, h, w) - 5D
         background_motion_for_sample = background_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
-        background_deformed = self.grid_sample(feature, background_motion_for_sample)
+        background_deformed = F.grid_sample(feature, background_motion_for_sample, align_corners=False)
         deformed_features_list.append(background_deformed)
 
         # Process each keypoint
@@ -74,7 +72,7 @@ class DenseMotionNetwork(nn.Module):
             end_idx = 3 + (kp_idx + 1) * 3
             kp_motion = sparse_motions[:, start_idx:end_idx, :, :, :]  # (bs, 3, d, h, w) - 5D
             kp_motion_for_sample = kp_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
-            kp_deformed = self.grid_sample(feature, kp_motion_for_sample)
+            kp_deformed = F.grid_sample(feature, kp_motion_for_sample, align_corners=False)
             deformed_features_list.append(kp_deformed)
 
         # Concatenate all deformed features: (bs, (num_kp+1)*c, d, h, w) - 5D

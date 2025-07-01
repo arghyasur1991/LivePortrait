@@ -277,39 +277,6 @@ class Hourglass(nn.Module):
         return self.decoder(self.encoder(x))
 
 
-class AntiAliasInterpolation2d(nn.Module):
-    """
-    Bilinear interpolation with anti-alias
-    """
-    def __init__(self, channels, scale):
-        super(AntiAliasInterpolation2d, self).__init__()
-        sigma = (1 / scale - 1) / 2
-        kernel_size = 2 * round(sigma * 4) + 1
-        self.scale = scale
-
-        kernel = torch.ones([1, 1, kernel_size, kernel_size])
-        kernel = F.softmax(kernel, dim=-1)
-
-        self.register_buffer('kernel', kernel)
-        self.groups = channels
-
-    def forward(self, x):
-        # Cast kernel to the same dtype and device as x
-        kernel = self.kernel.to(x.dtype)
-
-        # Apply padding
-        pad_size = (self.kernel.shape[-1] - 1) // 2
-        x = F.pad(x, [pad_size, pad_size, pad_size, pad_size], mode='reflect')
-
-        # Apply convolution
-        x = F.conv2d(x, kernel.expand(self.groups, -1, -1, -1), groups=self.groups)
-
-        # Apply interpolation
-        if self.scale != 1.0:
-            x = F.interpolate(x, scale_factor=self.scale, mode='bilinear', align_corners=False)
-        return x
-
-
 class SPADE(nn.Module):
     def __init__(self, norm_nc, label_nc):
         super().__init__()
@@ -664,27 +631,19 @@ class GridSample3DEquivalent(nn.Module):
         input_reshaped = input_tensor.permute(0, 2, 1, 3, 4).reshape(N * D_in, C, H_in, W_in)
 
         grid_xy = grid[..., :2]
-        # grid_xy has shape (N, D_out, H_out, W_out, 2)
-
-        # Reshape grid to (N, D_out, H_out*W_out, 2) to keep D_out separate
-        grid_xy_reshaped = grid_xy.reshape(N, D_out, H_out * W_out, 2)
-
-        # Repeat for each of the D_in slices
-        grid_final = grid_xy_reshaped.repeat_interleave(D_in, dim=0)
-        # grid_final has shape (N * D_in, D_out, H_out * W_out, 2)
+        grid_tiled = grid_xy.unsqueeze(1).repeat(1, D_in, 1, 1, 1, 1).view(N * D_in, D_out, H_out, W_out, 2)
 
         sampled_all_depths = F.grid_sample(
             input_reshaped,
-            grid_final,
+            grid_tiled,
             mode='bilinear',
             padding_mode=self.padding_mode,
             align_corners=self.align_corners
         )
-        # sampled_all_depths has shape (N * D_in, C, D_out, H_out * W_out)
 
         # --- Step 2: Prepare for linear interpolation along depth ---
-        # Reshape to (N, D_in, C, D_out, H_out*W_out) - this is 5D and avoids huge dims
-        s_5d = sampled_all_depths.view(N, D_in, C, D_out, H_out * W_out)
+        s_view = sampled_all_depths.view(N, D_in, C, D_out, H_out, W_out)
+        s_permuted = s_view.permute(0, 2, 3, 4, 5, 1)
 
         grid_z = grid[..., 2]
         if self.align_corners:
@@ -694,33 +653,18 @@ class GridSample3DEquivalent(nn.Module):
 
         z_floor = torch.floor(z_unnormalized)
         z_ceil = z_floor + 1
-        z_weight = (z_unnormalized - z_floor).unsqueeze(1) # For broadcasting with channels
+        z_weight = (z_unnormalized - z_floor).unsqueeze(1)
 
-        # --- Step 3: Select floor/ceil values via ONNX-friendly arithmetic ---
-        dtype = s_5d.dtype
-        d_range = torch.arange(D_in, device=s_5d.device, dtype=dtype).view(1, D_in, 1, 1)
+        z_floor = z_floor.long().clamp(0, D_in - 1)
+        z_ceil = z_ceil.long().clamp(0, D_in - 1)
 
-        # Clamp and reshape z_floor/z_ceil for broadcasting against d_range
-        z_floor_f = z_floor.clamp(0, D_in - 1).reshape(N, 1, D_out, H_out * W_out)
-        z_ceil_f = z_ceil.clamp(0, D_in - 1).reshape(N, 1, D_out, H_out * W_out)
+        # --- Step 3: Gather floor/ceil values and interpolate ---
+        def prepare_index(idx):
+            idx = idx.unsqueeze(1).unsqueeze(-1)
+            return idx.expand(-1, C, -1, -1, -1, -1)
 
-        # Create selectors using primitive arithmetic relu(1 - |x-y|) to be fully ONNX-safe
-        floor_diff = torch.abs(z_floor_f - d_range)
-        floor_selector = F.relu(1.0 - floor_diff)
+        floor_vals = s_permuted.gather(dim=5, index=prepare_index(z_floor)).squeeze(-1)
+        ceil_vals = s_permuted.gather(dim=5, index=prepare_index(z_ceil)).squeeze(-1)
 
-        ceil_diff = torch.abs(z_ceil_f - d_range)
-        ceil_selector = F.relu(1.0 - ceil_diff)
-        # Selectors are shape (N, D_in, D_out, H_out * W_out)
-
-        # Use selectors to get weighted values from each depth slice
-        # Unsqueeze C dim in selector for broadcasting: (N, D_in, 1, D_out, H_out*W_out)
-        floor_vals = (s_5d * floor_selector.unsqueeze(2)).sum(dim=1)
-        ceil_vals = (s_5d * ceil_selector.unsqueeze(2)).sum(dim=1)
-        # floor_vals and ceil_vals have shape (N, C, D_out, H_out * W_out)
-
-        # --- Step 4: Final interpolation ---
-        z_weight_reshaped = z_weight.reshape(N, 1, D_out, H_out * W_out)
-        output = (1 - z_weight_reshaped) * floor_vals + z_weight_reshaped * ceil_vals
-
-        # Reshape to final output format: (N, C, D_out, H_out, W_out)
-        return output.view(N, C, D_out, H_out, W_out)
+        output = (1 - z_weight) * floor_vals + z_weight * ceil_vals
+        return output
