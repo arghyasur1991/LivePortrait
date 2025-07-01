@@ -7,7 +7,7 @@ The module that predicting a dense motion from sparse motion representation give
 from torch import nn
 import torch.nn.functional as F
 import torch
-from .util import Hourglass, Conv3DEquivalent, BatchNorm3DEquivalent, make_coordinate_grid, kp2gaussian
+from .util import Hourglass, Conv3DEquivalent, BatchNorm3DEquivalent, make_coordinate_grid, kp2gaussian, GridSample3DEquivalent
 
 
 class DenseMotionNetwork(nn.Module):
@@ -18,6 +18,7 @@ class DenseMotionNetwork(nn.Module):
         self.mask = Conv3DEquivalent(self.hourglass.out_filters, num_kp + 1, kernel_size=7, padding=3)  # 65G! NOTE: computation cost is large
         self.compress = Conv3DEquivalent(feature_channel, compress, kernel_size=1)  # 0.8G
         self.norm = BatchNorm3DEquivalent(compress, affine=True)
+        self.grid_sample = GridSample3DEquivalent(padding_mode='zeros', align_corners=False)
         self.num_kp = num_kp
         self.flag_estimate_occlusion_map = estimate_occlusion_map
 
@@ -63,7 +64,7 @@ class DenseMotionNetwork(nn.Module):
         # Background (identity) feature
         background_motion = sparse_motions[:, :3, :, :, :]  # (bs, 3, d, h, w) - 5D
         background_motion_for_sample = background_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
-        background_deformed = F.grid_sample(feature, background_motion_for_sample, align_corners=False)
+        background_deformed = self.grid_sample(feature, background_motion_for_sample)
         deformed_features_list.append(background_deformed)
 
         # Process each keypoint
@@ -72,7 +73,7 @@ class DenseMotionNetwork(nn.Module):
             end_idx = 3 + (kp_idx + 1) * 3
             kp_motion = sparse_motions[:, start_idx:end_idx, :, :, :]  # (bs, 3, d, h, w) - 5D
             kp_motion_for_sample = kp_motion.permute(0, 2, 3, 4, 1)  # (bs, d, h, w, 3) - 5D
-            kp_deformed = F.grid_sample(feature, kp_motion_for_sample, align_corners=False)
+            kp_deformed = self.grid_sample(feature, kp_motion_for_sample)
             deformed_features_list.append(kp_deformed)
 
         # Concatenate all deformed features: (bs, (num_kp+1)*c, d, h, w) - 5D

@@ -622,49 +622,85 @@ class GridSample3DEquivalent(nn.Module):
         self.align_corners = align_corners
 
     def forward(self, input_tensor, grid):
-        # input_tensor: (N, C, D_in, H_in, W_in)
-        # grid: (N, D_out, H_out, W_out, 3) -> (x, y, z) coords
+        """
+        Perform trilinear sampling (equivalent to `F.grid_sample` with a 5-D input)
+        using only 2-D `grid_sample` calls and tensors whose rank never exceeds 5.
+
+        Parameters
+        ----------
+        input_tensor : Tensor
+            Shape ``(N, C, D_in, H_in, W_in)``
+        grid : Tensor
+            Shape ``(N, D_out, H_out, W_out, 3)`` with coordinates in the
+            range ``[-1, 1]``.
+        Returns
+        -------
+        Tensor
+            The sampled output of shape ``(N, C, D_out, H_out, W_out)``.
+        """
+
+        # ---- unpack shapes ----
         N, C, D_in, H_in, W_in = input_tensor.shape
         _, D_out, H_out, W_out, _ = grid.shape
 
-        # --- Step 1: Bilinearly sample all input depth slices ---
-        input_reshaped = input_tensor.permute(0, 2, 1, 3, 4).reshape(N * D_in, C, H_in, W_in)
+        # Pre-allocate the output tensor  (rank = 5)
+        output = input_tensor.new_empty((N, C, D_out, H_out, W_out))
 
-        grid_xy = grid[..., :2]
-        grid_tiled = grid_xy.unsqueeze(1).repeat(1, D_in, 1, 1, 1, 1).view(N * D_in, D_out, H_out, W_out, 2)
+        # Move depth dimension into batch so that we can use 2-D grid_sample once
+        # and reuse it for every output depth slice inside the Python loop.
+        src_slices = input_tensor.permute(0, 2, 1, 3, 4)          # (N, D_in, C, H_in, W_in)
+        src_slices = src_slices.reshape(N * D_in, C, H_in, W_in)   # (N*D_in, C, H_in, W_in)  – rank 4
 
-        sampled_all_depths = F.grid_sample(
-            input_reshaped,
-            grid_tiled,
-            mode='bilinear',
-            padding_mode=self.padding_mode,
-            align_corners=self.align_corners
-        )
+        for k in range(D_out):
+            # ---- 1. bilinear sampling in the (x, y) plane ----
+            grid_xy = grid[:, k, ..., :2]                         # (N, H_out, W_out, 2) – rank 4
 
-        # --- Step 2: Prepare for linear interpolation along depth ---
-        s_view = sampled_all_depths.view(N, D_in, C, D_out, H_out, W_out)
-        s_permuted = s_view.permute(0, 2, 3, 4, 5, 1)
+            # Repeat the same (x, y) grid for every input depth slice by
+            # duplicating along the *batch* axis.  No tensor exceeds rank 4 here.
+            tiled_xy = grid_xy.repeat_interleave(D_in, dim=0)     # (N*D_in, H_out, W_out, 2)
 
-        grid_z = grid[..., 2]
-        if self.align_corners:
-            z_unnormalized = (grid_z + 1) / 2 * (D_in - 1)
-        else:
-            z_unnormalized = ((grid_z + 1) * D_in - 1) / 2
+            sampled_2d = F.grid_sample(
+                src_slices,
+                tiled_xy,
+                mode='bilinear',
+                padding_mode=self.padding_mode,
+                align_corners=self.align_corners,
+            )                                                     # (N*D_in, C, H_out, W_out)
 
-        z_floor = torch.floor(z_unnormalized)
-        z_ceil = z_floor + 1
-        z_weight = (z_unnormalized - z_floor).unsqueeze(1)
+            # Restore the depth axis (rank becomes 5, still ≤ 5)
+            sampled_2d = sampled_2d.view(N, D_in, C, H_out, W_out)  # (N, D_in, C, H_out, W_out)
+            sampled_2d = sampled_2d.permute(0, 2, 1, 3, 4)         # (N, C, D_in, H_out, W_out)
 
-        z_floor = z_floor.long().clamp(0, D_in - 1)
-        z_ceil = z_ceil.long().clamp(0, D_in - 1)
+            # ---- 2. linear interpolation along the z axis ----
+            z_norm = grid[:, k, ..., 2]                            # (N, H_out, W_out)
 
-        # --- Step 3: Gather floor/ceil values and interpolate ---
-        def prepare_index(idx):
-            idx = idx.unsqueeze(1).unsqueeze(-1)
-            return idx.expand(-1, C, -1, -1, -1, -1)
+            if self.align_corners:
+                z_real = (z_norm + 1) / 2 * (D_in - 1)            # map to [0, D_in-1]
+            else:
+                z_real = ((z_norm + 1) * D_in - 1) / 2
 
-        floor_vals = s_permuted.gather(dim=5, index=prepare_index(z_floor)).squeeze(-1)
-        ceil_vals = s_permuted.gather(dim=5, index=prepare_index(z_ceil)).squeeze(-1)
+            z0 = torch.floor(z_real).long().clamp(0, D_in - 1)     # (N, H_out, W_out)
+            z1 = (z0 + 1).clamp(0, D_in - 1)                      # (N, H_out, W_out)
+            w1 = (z_real - z0.float())                             # (N, H_out, W_out)
 
-        output = (1 - z_weight) * floor_vals + z_weight * ceil_vals
+            # Prepare gather indices – keep rank = 5 throughout
+            def make_indices(idx: torch.Tensor) -> torch.Tensor:
+                # idx: (N, H_out, W_out) → (N, C, 1, H_out, W_out)
+                idx_exp = idx.unsqueeze(1)                         # (N, 1, H_out, W_out)
+                idx_exp = idx_exp.repeat(1, C, 1, 1)              # (N, C, H_out, W_out)
+                return idx_exp.unsqueeze(2)                        # (N, C, 1, H_out, W_out)
+
+            gather_z0 = make_indices(z0)
+            gather_z1 = make_indices(z1)
+
+            vals_z0 = torch.gather(sampled_2d, 2, gather_z0).squeeze(2)  # (N, C, H_out, W_out)
+            vals_z1 = torch.gather(sampled_2d, 2, gather_z1).squeeze(2)  # (N, C, H_out, W_out)
+
+            w1 = w1.unsqueeze(1)  # (N, 1, H_out, W_out) for broadcasting over channels
+
+            out_slice = (1 - w1) * vals_z0 + w1 * vals_z1               # (N, C, H_out, W_out)
+
+            # ---- 3. write the slice back ----
+            output[:, :, k, :, :] = out_slice
+
         return output
