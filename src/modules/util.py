@@ -123,7 +123,7 @@ class UpBlock3d(nn.Module):
 
         self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
                               padding=padding, groups=groups)
-        self.norm = nn.BatchNorm3d(out_features, affine=True)
+        self.norm = BatchNorm3DEquivalent(out_features, affine=True)
 
     def forward(self, x):
         out = F.interpolate(x, scale_factor=(1, 2, 2))
@@ -165,7 +165,7 @@ class DownBlock3d(nn.Module):
         '''
         self.conv = nn.Conv3d(in_channels=in_features, out_channels=out_features, kernel_size=kernel_size,
                               padding=padding, groups=groups)
-        self.norm = nn.BatchNorm3d(out_features, affine=True)
+        self.norm = BatchNorm3DEquivalent(out_features, affine=True)
         # Use 2D pooling to maintain rank 4 constraint
         self.pool = nn.AvgPool2d(kernel_size=(2, 2))
 
@@ -248,7 +248,7 @@ class Decoder(nn.Module):
         self.out_filters = block_expansion + in_features
 
         self.conv = nn.Conv3d(in_channels=self.out_filters, out_channels=self.out_filters, kernel_size=3, padding=1)
-        self.norm = nn.BatchNorm3d(self.out_filters, affine=True)
+        self.norm = BatchNorm3DEquivalent(self.out_filters, affine=True)
 
     def forward(self, x):
         out = x.pop()
@@ -613,7 +613,7 @@ class BatchNorm3DEquivalent(nn.Module):
         # Permute back to original layout: (bs, d, c, h, w) -> (bs, c, d, h, w)
         output = output_permuted.permute(0, 2, 1, 3, 4)
 
-        return output
+        return output.contiguous()
 
     def load_batchnorm3d_weights(self, bn3d_weight, bn3d_bias, bn3d_running_mean, bn3d_running_var):
         """Load weights from a BatchNorm3d layer."""
