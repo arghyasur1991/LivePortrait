@@ -22,7 +22,7 @@ from ..modules.warping_network import WarpingNetwork
 from ..modules.motion_extractor import MotionExtractor
 from ..modules.appearance_feature_extractor import AppearanceFeatureExtractor
 from ..modules.stitching_retargeting_network import StitchingRetargetingNetwork
-from ..modules.util import BatchNorm3DEquivalent
+from ..modules.util import BatchNorm3DEquivalent, Conv3DEquivalent
 
 def tensor_to_numpy(data: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
     """transform torch.Tensor into numpy.ndarray"""
@@ -198,7 +198,19 @@ def load_model(ckpt_path, model_config, device, model_type):
                 new_checkpoint[k] = v
         checkpoint = new_checkpoint
 
-    model.load_state_dict(checkpoint)
+    conv3d_names = [name for name, module in model.named_modules() if isinstance(module, Conv3DEquivalent)]
+    if conv3d_names:
+        for conv3d_name in conv3d_names:
+            conv3d_module = dict(model.named_modules())[conv3d_name]
+            weight_key = f"{conv3d_name}.weight"
+            bias_key = f"{conv3d_name}.bias"
+
+            if weight_key in checkpoint:
+                conv3d_weight = checkpoint.pop(weight_key)
+                conv3d_bias = checkpoint.pop(bias_key, None)
+                conv3d_module.load_conv3d_weights(conv3d_weight, conv3d_bias)
+
+    model.load_state_dict(checkpoint, strict=False)
     model.eval()
     return model
 
