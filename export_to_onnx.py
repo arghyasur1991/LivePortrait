@@ -260,6 +260,11 @@ def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"
         model = onnx.load(fp16_model_path)
         model_simp, check = simplify(model)
 
+        # Remove problematic Cast nodes on inputs for specific models
+        if model_type == "spade":
+            print("🔧 Applying Cast node removal for spade model...")
+            model_simp = remove_cast_nodes_on_inputs(model_simp)
+
         # Save original model as backup
         shutil.copy(fp16_model_path, fp16_model_path + ".original")
         onnx.save(model_simp, fp16_model_path)
@@ -270,6 +275,75 @@ def convert_model_to_fp16(fp32_model_path, fp16_model_path, model_type="general"
     except Exception as e:
         print(f"✗ Failed to convert {fp32_model_path} to FP16: {e}")
         return False
+
+def remove_cast_nodes_on_inputs(model):
+    """
+    Removes Cast nodes that are directly connected to graph inputs and updates
+    the input type accordingly. It also runs shape/type inference to ensure
+    graph consistency.
+    This is a workaround for some ONNX conversion issues where a Cast node
+    without a preceding node is not supported. The graph is rewired to
+    connect the original input to downstream nodes.
+    """
+    graph = model.graph
+    graph_input_names = {inp.name for inp in graph.input}
+    nodes_to_remove = []
+    rewiring_map = {}
+    inputs_to_update = {}  # Map input_name -> new_type_proto
+
+    for node in graph.node:
+        if node.op_type == 'Cast' and len(node.input) > 0 and node.input[0] in graph_input_names:
+            cast_input_name = node.input[0]
+            cast_output_name = node.output[0]
+
+            # Get the target type from the 'to' attribute of the Cast node
+            target_type = None
+            for attr in node.attribute:
+                if attr.name == 'to':
+                    target_type = attr.i
+                    break
+
+            if target_type is not None:
+                nodes_to_remove.append(node)
+                rewiring_map[cast_output_name] = cast_input_name
+                inputs_to_update[cast_input_name] = target_type
+                print(f"Identified Cast node on input '{cast_input_name}' to be removed. Input type will be updated.")
+
+    if not nodes_to_remove:
+        print("No Cast nodes on inputs to remove.")
+        return model
+
+    # Update the elem_type of the graph inputs
+    for inp in graph.input:
+        if inp.name in inputs_to_update:
+            new_type = inputs_to_update[inp.name]
+            inp.type.tensor_type.elem_type = new_type
+            print(f"Updated graph input '{inp.name}' to data type enum {new_type}.")
+
+    # Remove the identified Cast nodes and rewire the graph
+    new_nodes = [node for node in graph.node if node not in nodes_to_remove]
+
+    for node in new_nodes:
+        for i, input_name in enumerate(node.input):
+            if input_name in rewiring_map:
+                node.input[i] = rewiring_map[input_name]
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    print(f"Removed {len(nodes_to_remove)} Cast nodes from graph inputs.")
+
+    # Re-run shape inference to ensure the graph is consistent
+    try:
+        print("🔧 Running shape and type inference to ensure model consistency...")
+        inferred_model = onnx.shape_inference.infer_shapes(model)
+        onnx.checker.check_model(inferred_model)
+        print("✅ Model consistency check passed after modifications.")
+        return inferred_model
+    except Exception as e:
+        print(f"⚠️ Shape inference failed, returning model without it. Error: {e}")
+        # Still run a basic check on the model without full inference
+        onnx.checker.check_model(model)
+        return model
 
 def convert_model_to_int8_static_qdq(fp32_model_path, int8_model_path, model_type="general"):
     """Convert FP32 ONNX model to INT8 using static quantization with QDQ format"""
