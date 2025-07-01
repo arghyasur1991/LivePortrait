@@ -22,6 +22,8 @@ from ..modules.warping_network import WarpingNetwork
 from ..modules.motion_extractor import MotionExtractor
 from ..modules.appearance_feature_extractor import AppearanceFeatureExtractor
 from ..modules.stitching_retargeting_network import StitchingRetargetingNetwork
+from ..modules.util import BatchNorm3DEquivalent
+
 def tensor_to_numpy(data: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
     """transform torch.Tensor into numpy.ndarray"""
     if isinstance(data, torch.Tensor):
@@ -178,7 +180,25 @@ def load_model(ckpt_path, model_config, device, model_type):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    model.load_state_dict(torch.load(ckpt_path, map_location=lambda storage, loc: storage))
+    checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    bn3d_names = [name for name, module in model.named_modules() if isinstance(module, BatchNorm3DEquivalent)]
+
+    if bn3d_names:
+        new_checkpoint = OrderedDict()
+        for k, v in checkpoint.items():
+            key_was_modified = False
+            for bn3d_name in bn3d_names:
+                if k.startswith(bn3d_name + '.'):
+                    suffix = k[len(bn3d_name) + 1:]
+                    new_k = f"{bn3d_name}.norm2d.{suffix}"
+                    new_checkpoint[new_k] = v
+                    key_was_modified = True
+                    break
+            if not key_was_modified:
+                new_checkpoint[k] = v
+        checkpoint = new_checkpoint
+
+    model.load_state_dict(checkpoint)
     model.eval()
     return model
 

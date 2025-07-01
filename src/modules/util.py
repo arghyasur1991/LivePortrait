@@ -598,14 +598,20 @@ class BatchNorm3DEquivalent(nn.Module):
         # Input: (bs, c, d, h, w)
         bs, c, d, h, w = x.shape
 
-        # Reshape to process all depth slices together: (bs*d, c, h, w)
-        x_reshaped = x.reshape(bs * d, c, h, w)
+        # Reshape to process all depth slices together: (bs, c, d, h, w) -> (bs, d, c, h, w)
+        x_permuted = x.permute(0, 2, 1, 3, 4)
+
+        # Reshape to process all depth slices together: (bs, d, c, h, w) -> (bs * d, c, h, w)
+        x_reshaped = x_permuted.reshape(bs * d, c, h, w)
 
         # Apply 2D batch norm (mathematically equivalent to 3D)
         output_reshaped = self.norm2d(x_reshaped)  # (bs*d, c, h, w)
 
-        # Reshape back: (bs, c, d, h, w)
-        output = output_reshaped.reshape(bs, c, d, h, w)
+        # Reshape back: (bs*d, c, h, w) -> (bs, d, c, h, w)
+        output_permuted = output_reshaped.reshape(bs, d, c, h, w)
+
+        # Permute back to original layout: (bs, d, c, h, w) -> (bs, c, d, h, w)
+        output = output_permuted.permute(0, 2, 1, 3, 4)
 
         return output
 
@@ -619,6 +625,3 @@ class BatchNorm3DEquivalent(nn.Module):
             self.norm2d.running_mean.data = bn3d_running_mean
         if bn3d_running_var is not None:
             self.norm2d.running_var.data = bn3d_running_var
-
-
-
