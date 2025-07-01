@@ -584,36 +584,41 @@ class Conv3DEquivalent(nn.Module):
 class BatchNorm3DEquivalent(nn.Module):
     """
     Mathematically equivalent replacement for BatchNorm3d using BatchNorm2d.
+
+    Applies 2D batch normalization to each depth slice independently.
+    This is mathematically equivalent since BatchNorm3d also computes statistics
+    across batch and spatial dimensions independently for each channel.
     """
 
     def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
         super(BatchNorm3DEquivalent, self).__init__()
-        # Use BatchNorm1d to correctly handle stats over (N, D, H, W)
-        self.norm = nn.BatchNorm1d(num_features, eps=eps, momentum=momentum, affine=affine)
+        self.norm2d = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine)
 
     def forward(self, x):
         # Input: (bs, c, d, h, w)
         bs, c, d, h, w = x.shape
 
-        # Reshape for 1D batchnorm: (bs, c, d, h, w) -> (bs, c, d*h*w)
-        x_reshaped = x.view(bs, c, d * h * w)
+        # Reshape to process all depth slices together: (bs*d, c, h, w)
+        x_reshaped = x.reshape(bs * d, c, h, w)
 
-        # Apply 1D batch norm. It normalizes over the last dimension (d*h*w) and batch dimension (bs),
-        # which is equivalent to normalizing over (bs, d, h, w) for each channel.
-        output_reshaped = self.norm(x_reshaped)
+        # Apply 2D batch norm (mathematically equivalent to 3D)
+        output_reshaped = self.norm2d(x_reshaped)  # (bs*d, c, h, w)
 
-        # Reshape back: (bs, c, d*h*w) -> (bs, c, d, h, w)
-        output = output_reshaped.view(bs, c, d, h, w)
+        # Reshape back: (bs, c, d, h, w)
+        output = output_reshaped.reshape(bs, c, d, h, w)
 
         return output
 
     def load_batchnorm3d_weights(self, bn3d_weight, bn3d_bias, bn3d_running_mean, bn3d_running_var):
         """Load weights from a BatchNorm3d layer."""
         if bn3d_weight is not None:
-            self.norm.weight.data = bn3d_weight
+            self.norm2d.weight.data = bn3d_weight
         if bn3d_bias is not None:
-            self.norm.bias.data = bn3d_bias
+            self.norm2d.bias.data = bn3d_bias
         if bn3d_running_mean is not None:
-            self.norm.running_mean.data = bn3d_running_mean
+            self.norm2d.running_mean.data = bn3d_running_mean
         if bn3d_running_var is not None:
-            self.norm.running_var.data = bn3d_running_var
+            self.norm2d.running_var.data = bn3d_running_var
+
+
+
