@@ -7,7 +7,7 @@ keypoint representations x_s and x_d, and employs this flow field to warp the so
 
 from torch import nn
 import torch.nn.functional as F
-from .util import SameBlock2d
+from .util import SameBlock2d, GridSample3DEquivalent
 from .dense_motion import DenseMotionNetwork
 
 
@@ -42,9 +42,10 @@ class WarpingNetwork(nn.Module):
         self.fourth = nn.Conv2d(in_channels=block_expansion * (2 ** num_down_blocks), out_channels=block_expansion * (2 ** num_down_blocks), kernel_size=1, stride=1)
 
         self.estimate_occlusion_map = estimate_occlusion_map
+        self.grid_sample = GridSample3DEquivalent(padding_mode='zeros', align_corners=False)
 
     def deform_input(self, inp, deformation):
-        return F.grid_sample(inp, deformation, align_corners=False)
+        return self.grid_sample(inp, deformation)
 
     def forward(self, feature_3d, kp_driving, kp_source):
         if self.dense_motion_network is not None:

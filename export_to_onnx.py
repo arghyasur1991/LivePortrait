@@ -948,11 +948,11 @@ def main():
             "model_mappings": model_mappings
         }
 
-        config_path = output_dir / "onnx_config.json"
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+        # config_path = output_dir / "onnx_config.json"
+        # with open(config_path, 'w') as f:
+        #     json.dump(config, f, indent=2)
 
-        print(f"Configuration saved to: {config_path}")
+        # print(f"Configuration saved to: {config_path}")
 
         # Clean up temporary files
         cleanup_export_directory(output_dir)
