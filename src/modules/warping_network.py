@@ -42,7 +42,8 @@ class WarpingNetwork(nn.Module):
         self.fourth = nn.Conv2d(in_channels=block_expansion * (2 ** num_down_blocks), out_channels=block_expansion * (2 ** num_down_blocks), kernel_size=1, stride=1)
 
         self.estimate_occlusion_map = estimate_occlusion_map
-        self.grid_sample = GridSample3DEquivalent(padding_mode='zeros', align_corners=False)
+        # self.grid_sample = GridSample3DEquivalent(padding_mode='zeros', align_corners=False)
+        self.grid_sample = F.grid_sample
 
     def deform_input(self, inp, deformation):
         return self.grid_sample(inp, deformation)
