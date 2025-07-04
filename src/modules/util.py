@@ -635,11 +635,13 @@ class GridSample3DEquivalent(nn.Module):
         device, dtype = vol.device, vol.dtype
 
         # 1. x-y grid reused for every depth slice  ── rank 4 afterwards
-        grid_xy = grid[..., :2]                                   # (N,D_out,H_out,W_out,2)
+        # Use split to avoid gather operations in ONNX
+        grid_x, grid_y, z_norm = torch.split(grid, 1, dim=-1)    # Each: (N,D_out,H_out,W_out,1)
+        grid_xy = torch.cat([grid_x, grid_y], dim=-1)             # (N,D_out,H_out,W_out,2)
         grid_xy_4 = grid_xy.reshape(N*D_out, H_out, W_out, 2)    # (N·D_out,H_out,W_out,2)
 
         # 2. Continuous z coordinate for weight computation           (rank 4)
-        z_norm = grid[..., 2]                                     # (N,D_out,H_out,W_out)
+        z_norm = z_norm.squeeze(-1)                               # (N,D_out,H_out,W_out)
         if self.align_corners:
             z_f = (z_norm + 1) * (D_in - 1) / 2
         else:
@@ -658,7 +660,8 @@ class GridSample3DEquivalent(nn.Module):
             w_big = w_d.reshape(N*D_out, 1, H_out, W_out)        # (N·D_out,1,H_out,W_out)
 
             # 4-b  tile the slice along fake-batch        rank 5 → 4
-            slice_d = vol[:, :, d, :, :]                         # (N,C,H_in,W_in)  rank-4
+            # Use explicit slicing to avoid gather operations in ONNX
+            slice_d = vol[:, :, d:d+1, :, :].view(N, C, H_in, W_in)  # (N,C,H_in,W_in)  rank-4
             slice_big = (slice_d.unsqueeze(1)                    # (N,1,C,H,W)      rank-5
                                 .repeat(1, D_out, 1, 1, 1)
                                 .reshape(N*D_out, C, H_in, W_in)) # (N·D_out,C,H,W)   rank-4
